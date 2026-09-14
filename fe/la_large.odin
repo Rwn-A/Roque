@@ -22,6 +22,16 @@ Sparsity :: struct {
 	columns:  []i32,
 }
 
+// Column-major
+Dense_Matrix :: struct{
+	values: []f64,
+	rows, cols: i16,
+}
+
+dense_get :: proc(d: Dense_Matrix, #any_int row, col: i16) -> ^f64{
+	return &d.values[row * d.cols + col]
+}
+
 // Returns nil if entry does not exist.
 sp_get :: proc(sm: Sparse_Matrix, #any_int row, col: i32) -> ^f64 {
 	row_slice := sm.columns[sm.row_ptrs[row]:sm.row_ptrs[row + 1]]

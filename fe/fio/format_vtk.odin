@@ -98,7 +98,7 @@ vtu_output_writer :: proc(
 			element    = cell.type,
 		}
 
-		basis := fe.bstore_get_interior(fe.space_bd(coord_space, cell.type), rule, .Scalar)
+		basis := fe.bstore_get_interior(fe.space_bd(coord_space, cell.type), rule)
 		elem_coords := fe.space_gather(f64, {coord_space, coords}, cell.id, context.temp_allocator)
 
 		phys_points := fe.pvec_create(
@@ -110,11 +110,13 @@ vtu_output_writer :: proc(
 
 		// Because contractions need compile-time dims
 		switch coord_space.fields {
-		case 1: fe.contract_eval({.CMPNTS = 1, .FIELDS = 1}, phys_points, elem_coords, basis)
-		case 2: fe.contract_eval({.CMPNTS = 1, .FIELDS = 2}, phys_points, elem_coords, basis)
-		case 3: fe.contract_eval({.CMPNTS = 1, .FIELDS = 3}, phys_points, elem_coords, basis)
+		case 1: fe.contract_eval({.CMPNTS = 1, .FIELDS = 1}, phys_points, elem_coords, basis[.Scalar])
+		case 2: fe.contract_eval({.CMPNTS = 1, .FIELDS = 2}, phys_points, elem_coords, basis[.Scalar])
+		case 3: fe.contract_eval({.CMPNTS = 1, .FIELDS = 3}, phys_points, elem_coords, basis[.Scalar])
 		case: unreachable()
 		}
+
+		base_vertex_idx := i32(len(vertices))
 
 		for i in 0 ..< len(rule.ref_points) {
 			pvp := fe.pvec_at_point(phys_points, i)
@@ -123,7 +125,7 @@ vtu_output_writer :: proc(
 			append(&vertices, padded_point)
 		}
 
-		base_vertex_idx := i32(len(vertices))
+
 		for subcell in SUBCELLS[cell.type][order].connectivity {
 			for node_index in subcell { append(&connectivity, base_vertex_idx + i32(node_index)) }
 			append(&offsets, i32(len(connectivity)))

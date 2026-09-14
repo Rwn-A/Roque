@@ -103,7 +103,7 @@ small_mat_transpose :: proc(m: Small_Mat($R, $C, $T)) -> (r: Small_Mat(C, R, T))
 
 small_mat_columns :: proc(m: Small_Mat($R, $C, $T)) -> (r: [C]Small_Vec(R, T)) {
 	#unroll for col in 0 ..< C {
-		r[col] = m.data[col]
+		r[col].data = m.data[col]
 	}
 	return r
 }

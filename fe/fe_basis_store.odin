@@ -7,9 +7,8 @@ package fe
  rules are fixed tables, quadrature, dof functionals, etc so its quite natural and it
  works well when two different conceptual things (quadrature and RT functional rules) actually share the same points.
 
- The cache is thread local and lazy. Basis reference data is usually small compared
- to everything else going on, so lazy construction avoids error-prone cache warming,
- while thread locality avoids synchronization overhead.
+ The cache is thread local and lazy. Warming every type of basis needed is annoying an error-prone.
+ Thread local to avoid any sync overhead.
 */
 
 import "base:runtime"
@@ -36,9 +35,7 @@ _bstore: Basis_Store
 @(private)
 bstore :: proc() -> ^Basis_Store {
 	if _bstore.arena == {} {
-		if err := virtual.arena_init_growing(&_bstore.arena); err != nil {
-			panic("failed to init basis store arena")
-		}
+		virtual.arena_init_growing(&_bstore.arena) or_else panic("Failed to create arena.")
 		_bstore.tables = make(map[Tbl_Key][Basis_Quantity]Ref_Basis_Tbl, virtual.arena_allocator(&_bstore.arena))
 		runtime.add_thread_local_cleaner(proc "contextless" () {
 			context = runtime.default_context()
@@ -49,26 +46,25 @@ bstore :: proc() -> ^Basis_Store {
 }
 
 // Use when the basis element type is of the same type as the rule.
-bstore_get_interior :: proc(bd: Basis_Desc, rule: Rule, qty: Basis_Quantity) -> Ref_Basis_Tbl {
+bstore_get_interior :: proc(bd: Basis_Desc, rule: Rule) -> Basis_Entry {
 	assert(element_dim(bd.element) == element_dim(rule.element))
-	return bstore_get(bd, -1, rule, qty)
+	return bstore_get(bd, -1, rule)
 }
 
 // For when the rule is on the facet element type (surface quadrature)
-bstore_get_facet :: proc(bd: Basis_Desc, facet: int, rule: Rule, qty: Basis_Quantity) -> Ref_Basis_Tbl {
+bstore_get_facet :: proc(bd: Basis_Desc, facet: int, rule: Rule) -> Basis_Entry {
 	assert(element_facet_dim(bd.element) == element_dim(rule.element))
-	return bstore_get(bd, facet, rule, qty)
+	return bstore_get(bd, facet, rule)
 }
 
-bstore_get :: proc(bd: Basis_Desc, facet: int, rule: Rule, qty: Basis_Quantity) -> Ref_Basis_Tbl {
-	assert(qty in BASIS_QUANTITIES[bd.family], "Quantity is not naturally tabulated over basis family")
+bstore_get :: proc(bd: Basis_Desc, facet: int, rule: Rule) -> Basis_Entry {
 	store := bstore()
 	key := Tbl_Key{bd, facet, raw_data(rule.ref_points)}
-	if tbl, ok := store.tables[key]; ok { return tbl[qty] }
+	if tbl, ok := store.tables[key]; ok { return tbl }
 
 	tbl := basis_tab(bd, rule, facet if facet > -1 else nil, virtual.arena_allocator(&store.arena))
 	store.tables[key] = tbl
-	return tbl[qty]
+	return tbl
 }
 
 //== tabulation

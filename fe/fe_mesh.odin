@@ -4,9 +4,12 @@ package fe
  Basic conforming mesh for 1D-3D.
 
  Facets are nearly first-class with cells, this is in the interest of HDG, DG methods.
+
+ A facet may have > 2 incident cells, this is in the interest of 1D truss structures.
 */
 
 import "core:mem/virtual"
+import "core:slice"
 
 Entity_ID   :: i32
 Boundary_ID :: i8
@@ -23,9 +26,9 @@ Mesh :: struct {
 	cell_conn:              []Cell_Conn, // parallel array to cells
 	facets:                 []Facet,
 	incidences:             []Facet_Incidence,
-	nodes:                  [][3]f64,
 	cell_nodes:             [][]Entity_ID, // NOTE: must be same structure as an l2g in DOF numbering
 	periodics:              []Periodicity,
+	nodes:                  [][3]f64,
 	order:                  Order,
 	intrinsic_dim:          Dimension,
 	encountered_cell_types: bit_set[Element_Type],
@@ -37,8 +40,8 @@ Mesh :: struct {
 Cell :: struct {
 	id:               Entity_ID,
 	facets:           []Entity_ID, // directly references of the arrays from connectivity depending on dim.
-	edge_orientation: bit_set[0 ..< MAX_EDGES], // edge is either flipped or not
-	face_orientation: [MAX_FACETS]u8, // each face has multiple possible orientations
+	edge_orientation: [MAX_EDGES]u8,
+	face_orientation: [MAX_FACETS]u8,
 	using info:       Cell_Info,
 }
 
@@ -71,15 +74,38 @@ Facet_Incidence :: struct {
 }
 
 Periodicity :: struct {
-	master:    Boundary_ID,
-	slave:     Boundary_ID,
-	transform: Small_Mat(4, 4, f64),
-	pairs: 		 []Periodic_Pair,
+	master, slave: Boundary_ID,
+	transform:     Small_Mat(4, 4, f64), // kept around for user info, mesh already has what it needs in each pair.
+	pairs:         []Periodic_Pair,
 }
 
 Periodic_Pair :: struct {
-  master: Entity_ID,
-  slave:  Entity_ID,
+	master, slave: Entity_ID, // facet ids
+
+	// et-local vertex correspondence: vertex_map[master_local_v] = slave_local_v.
+	vertex_map: []int,
+
+	// Orientation relating master's own canonical order to slave's, for the facet's own interior/
+	// top-dimension dofs.
+	orientation: u8,
+
+	// et-local edge correspondence + each master edge's orientation relative to its matched slave edge's
+	// own canonical order. Only populated when the facet type has its own interior edges (et is 2D, i.e.
+	// a 3D mesh's boundary facets) — nil otherwise.
+	edge_map:         []int,
+	edge_orientation: []u8,
+}
+
+MESH_FRAME :: Small_Mat(3, 3, f64) {
+	data = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}},
+}
+
+X_SEGMENT_FRAME :: Small_Mat(3, 1, f64) {
+	data = {{1, 0, 0}},
+}
+
+XY_PLANE_FRAME :: Small_Mat(3, 2, f64) {
+	data = {{1, 0, 0}, {0, 1, 0}},
 }
 
 mesh_destroy :: proc(mesh: ^Mesh) {
@@ -100,33 +126,32 @@ mesh_region_set_from_names :: proc(mesh: Mesh, names: ..string) -> (rs: Region_S
 	return rs, true
 }
 
-mesh_periodicity_from_master :: proc(mesh: Mesh, master: Boundary_ID) -> (Periodicity, bool) {
-	for per in mesh.periodics {
-		if master == per.master { return per, true }
+mesh_periodicity :: proc(mesh: Mesh, master, slave: Boundary_ID) -> (Periodicity, bool) {
+	for per in mesh.periodics{
+		if per.master == master && per.slave == slave {return per, true}
 	}
 	return {}, false
 }
 
-MESH_FRAME :: Small_Mat(3, 3, f64) {
-	data = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}},
+mesh_periodicity_from_names :: proc(mesh: Mesh, master_name, slave_name: string) -> (p: Periodicity, ok: bool) {
+	master := mesh.boundary_names[master_name] or_return
+	slave := mesh.boundary_names[slave_name] or_return
+	for per in mesh.periodics{
+		if per.master == master && per.slave == slave {return per, true}
+	}
+	return {}, false
 }
 
-X_SEGMENT_FRAME :: Small_Mat(3, 1, f64) {
-	data = {{1, 0, 0}},
-}
-
-XY_PLANE_FRAME :: Small_Mat(3, 2, f64) {
-	data = {{1, 0, 0}, {0, 1, 0}},
-}
-
-// mesh coordinate coefficients for jacobian/physical point eval. The frame must be invertible or pseudo-invertible.
+// Mesh coordinate coefficients. This the "state" vector for the FE geometry space. For convienence,
+// a simple frame can be applied, this allows one to reduce the ambient space from 3D, or perform any other linear
+// transform.
+// NOTE: badly behaved transforms are not detected.
 mesh_coord_coeffs :: proc(mesh: Mesh, frame: Small_Mat(3, $C, f64), alloc := context.allocator) -> []f64 {
 	out := make([]f64, len(mesh.nodes) * C, alloc)
 
 	when C == 3 {
 		if frame == MESH_FRAME {
-			copy(out, slice.reinterpret([]f64, mesh.nodes))
-			return out
+			copy(out, slice.reinterpret([]f64, mesh.nodes)); return out
 		}
 	}
 
@@ -140,18 +165,20 @@ mesh_coord_coeffs :: proc(mesh: Mesh, frame: Small_Mat(3, $C, f64), alloc := con
 	return out
 }
 
+// All local facet indices of the cells boundary facets
 cell_boundary_facet_set :: proc(mesh: Mesh, c: Cell) -> (r: bit_set[0 ..< MAX_FACETS]) {
-	for local_facet in c.facets {
+	for local_facet, i in c.facets {
 		facet := mesh.facets[local_facet]
-		if facet_is_boundary(facet) { r += {int(local_facet)} }
+		if facet_is_boundary(facet) { r += {int(i)} }
 	}
 	return r
 }
 
+// Local facet indexes of the cell that have a boundary in the set.
 cell_boundary_facet_set_of :: proc(mesh: Mesh, c: Cell, bs: Boundary_Set) -> (r: bit_set[0 ..< MAX_FACETS]) {
-	for local_facet in c.facets {
+	for local_facet, i in c.facets {
 		facet := mesh.facets[local_facet]
-		if facet.info.boundary in bs { r += {int(local_facet)} }
+		if facet.info.boundary in bs { r += {int(i)} }
 	}
 	return r
 }
@@ -160,7 +187,7 @@ facet_incidences :: proc(mesh: Mesh, facet: Facet) -> []Facet_Incidence {
 	return mesh.incidences[facet.incidence_start:][:facet.incidence_count]
 }
 
-// Returns the first stored incident cell, not based on anything in particular.
+// Returns the first stored incident cell.
 facet_canonical_cell :: proc(mesh: Mesh, facet: Facet) -> (Cell, int) {
 	inc := facet_incidences(mesh, facet)[0]
 	return mesh.cells[inc.cell], int(inc.local_facet)
@@ -170,6 +197,7 @@ facet_is_boundary :: proc(facet: Facet) -> bool {
 	return facet.info.boundary != NOT_A_BOUNDARY
 }
 
+// All regions of incident cells.
 facet_regions :: proc(mesh: Mesh, facet: Facet) -> (r: Region_Set) {
 	for incidence in facet_incidences(mesh, facet) {
 		r += {mesh.cells[incidence.cell].info.region}
@@ -230,7 +258,10 @@ segment_mesh :: proc(n_cells: int, start, end: f64) -> Mesh {
 	left_id := mesh.boundary_names["left"]
 	right_id := mesh.boundary_names["right"]
 
-	mesh.incidences[0] = Facet_Incidence{local_facet = 0, cell = 0}
+	mesh.incidences[0] = Facet_Incidence {
+		local_facet = 0,
+		cell        = 0,
+	}
 	mesh.facets[0] = Facet {
 		id = 0,
 		incidence_count = 1,
@@ -240,8 +271,14 @@ segment_mesh :: proc(n_cells: int, start, end: f64) -> Mesh {
 
 	for p in 1 ..< n_points - 1 {
 		off := 2 * p - 1
-		mesh.incidences[off]     = Facet_Incidence{local_facet = 1, cell = Entity_ID(p - 1)}
-		mesh.incidences[off + 1] = Facet_Incidence{local_facet = 0, cell = Entity_ID(p)}
+		mesh.incidences[off] = Facet_Incidence {
+			local_facet = 1,
+			cell        = Entity_ID(p - 1),
+		}
+		mesh.incidences[off + 1] = Facet_Incidence {
+			local_facet = 0,
+			cell        = Entity_ID(p),
+		}
 		mesh.facets[p] = Facet {
 			id = Entity_ID(p),
 			incidence_count = 2,
@@ -252,7 +289,10 @@ segment_mesh :: proc(n_cells: int, start, end: f64) -> Mesh {
 
 	last := n_points - 1
 	off := 2 * n_cells - 1
-	mesh.incidences[off] = Facet_Incidence{local_facet = 1, cell = Entity_ID(n_cells - 1)}
+	mesh.incidences[off] = Facet_Incidence {
+		local_facet = 1,
+		cell        = Entity_ID(n_cells - 1),
+	}
 	mesh.facets[last] = Facet {
 		id = Entity_ID(last),
 		incidence_count = 1,
