@@ -170,9 +170,11 @@ element_facet_verts :: proc(et: Element_Type, facet: int) -> []int {
 	return REFERENCE_ELEMENTS[et].topo.sub_entity_verts[element_facet_dim(et)][facet]
 }
 
-element_facet_ref_normal :: proc(et: Element_Type, facet: int) -> Ref_Vec {
+// Returns the reference facet normal as a small vector for use in geometry, I must be the intrinsic dimension of `et`
+element_facet_ref_normal :: proc($T: typeid, $I: int, et: Element_Type, facet: int) -> Small_Vec(I, T) {
 	assert(et != .Point)
-	return REFERENCE_ELEMENTS[et].topo.facet_ref_normals[facet]
+	assert(I == int(element_dim(et)))
+	small_vec_from_slice(T, REFERENCE_ELEMENTS[et].topo.facet_ref_normals[facet], I)
 }
 
 // Find orientation key from a given vertex order, based on the target order.
@@ -244,16 +246,16 @@ Basis_Desc :: struct {
 }
 
 Basis_Quantity :: enum {
-	Scalar,
-	Vector,
-	Scalar_Gradient,
-	Vector_Divergence,
+	S_Val,
+	V_Val,
+	S_Grd,
+	V_Div,
 }
 
 @(rodata)
 BASIS_QUANTITIES := [Basis_Family]bit_set[Basis_Quantity] {
-	.Lagrange       = {.Scalar, .Scalar_Gradient},
-	.Raviart_Thomas = {.Vector, .Vector_Divergence},
+	.Lagrange       = {.S_Val, .S_Grd},
+	.Raviart_Thomas = {.V_Val, .V_Div},
 }
 
 // Generalization of a quadrature rule
@@ -263,20 +265,22 @@ Rule :: struct {
 	weights:    []f64, // optional
 }
 
-basis_infer_quad :: proc(bd: Basis_Desc) -> Rule{
-	o := int(bd.order) * 2
+// Rough heuristic of 2 * basis order as polynomial degree to be integrated.
+basis_infer_quad :: proc(bd: Basis_Desc) -> Rule {
+	o := (int(bd.order) + 1) * 2
 	switch {
-	case 0 <= 1: return element_quad_rule(bd.element, .Q1)
-	case 0 <= 3: return element_quad_rule(bd.element, .Q3)
-	case 0 <= 5: return element_quad_rule(bd.element, .Q5)
+	case o <= 1: return element_quad_rule(bd.element, .Q1)
+	case o <= 3: return element_quad_rule(bd.element, .Q3)
+	case o <= 5: return element_quad_rule(bd.element, .Q5)
 	case: return element_quad_rule(bd.element, .Q5)
 	}
 }
 
+// how many scalars are needed to represent the quantity in reference space.
 basis_quantity_components :: proc(et: Element_Type, qty: Basis_Quantity) -> int {
 	switch qty {
-	case .Scalar, .Vector_Divergence: return 1
-	case .Vector, .Scalar_Gradient: return int(element_dim(et))
+	case .S_Val, .V_Div: return 1
+	case .V_Val, .S_Grd: return int(element_dim(et))
 	case: unreachable()
 	}
 }
@@ -311,15 +315,8 @@ basis_sub_entity_perm :: proc(bd: Basis_Desc, sub_entity: Element_Type, orientat
 	return basis_info_core(bd).sub_entity_perms[sub_entity][orientation]
 }
 
-basis_orient_dof :: proc(
-	bd: Basis_Desc,
-	sub_et: Element_Type,
-	orientation: u8,
-	local: int,
-) -> (
-	canonical: int,
-	flip: bool,
-) {
+// `local` is the `entity_dof_index` for the given `sub_et`.
+basis_orient_dof :: proc(bd: Basis_Desc, sub_et: Element_Type, orientation: u8, local: int) -> (dof: int, flip: bool) {
 	perm := basis_sub_entity_perm(bd, sub_et, orientation)
 	return perm.perm[local], perm.sign[local] == -1
 }

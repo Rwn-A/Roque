@@ -23,12 +23,12 @@ Sparsity :: struct {
 }
 
 // Column-major
-Dense_Matrix :: struct{
-	values: []f64,
+Dense_Matrix :: struct {
+	values:     []f64,
 	rows, cols: i16,
 }
 
-dense_get :: proc(d: Dense_Matrix, #any_int row, col: i16) -> ^f64{
+dense_get :: proc(d: Dense_Matrix, #any_int row, col: i16) -> ^f64 {
 	return &d.values[row * d.cols + col]
 }
 

@@ -80,21 +80,16 @@ Periodicity :: struct {
 }
 
 Periodic_Pair :: struct {
-	master, slave: Entity_ID, // facet ids
+	master, slave:    Entity_ID, // facet ids
+	vertex_map:       []int, // et-local vertex correspondence: vertex_map[master_local_v] = slave_local_v.
+	orientation:      u8, // Orientation relating master cannonical rotation to slaves
 
-	// et-local vertex correspondence: vertex_map[master_local_v] = slave_local_v.
-	vertex_map: []int,
-
-	// Orientation relating master's own canonical order to slave's, for the facet's own interior/
-	// top-dimension dofs.
-	orientation: u8,
-
-	// et-local edge correspondence + each master edge's orientation relative to its matched slave edge's
-	// own canonical order. Only populated when the facet type has its own interior edges (et is 2D, i.e.
-	// a 3D mesh's boundary facets) — nil otherwise.
+	// for 3d only, edge orientation mappings.
 	edge_map:         []int,
 	edge_orientation: []u8,
 }
+
+//== Accessors & general mesh queries
 
 MESH_FRAME :: Small_Mat(3, 3, f64) {
 	data = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}},
@@ -127,8 +122,8 @@ mesh_region_set_from_names :: proc(mesh: Mesh, names: ..string) -> (rs: Region_S
 }
 
 mesh_periodicity :: proc(mesh: Mesh, master, slave: Boundary_ID) -> (Periodicity, bool) {
-	for per in mesh.periodics{
-		if per.master == master && per.slave == slave {return per, true}
+	for per in mesh.periodics {
+		if per.master == master && per.slave == slave { return per, true }
 	}
 	return {}, false
 }
@@ -136,15 +131,14 @@ mesh_periodicity :: proc(mesh: Mesh, master, slave: Boundary_ID) -> (Periodicity
 mesh_periodicity_from_names :: proc(mesh: Mesh, master_name, slave_name: string) -> (p: Periodicity, ok: bool) {
 	master := mesh.boundary_names[master_name] or_return
 	slave := mesh.boundary_names[slave_name] or_return
-	for per in mesh.periodics{
-		if per.master == master && per.slave == slave {return per, true}
+	for per in mesh.periodics {
+		if per.master == master && per.slave == slave { return per, true }
 	}
 	return {}, false
 }
 
 // Mesh coordinate coefficients. This the "state" vector for the FE geometry space. For convienence,
-// a simple frame can be applied, this allows one to reduce the ambient space from 3D, or perform any other linear
-// transform.
+// a simple frame can be applied, this allows one to reduce the ambient space from 3D, or any other transform.
 // NOTE: badly behaved transforms are not detected.
 mesh_coord_coeffs :: proc(mesh: Mesh, frame: Small_Mat(3, $C, f64), alloc := context.allocator) -> []f64 {
 	out := make([]f64, len(mesh.nodes) * C, alloc)

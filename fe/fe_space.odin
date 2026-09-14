@@ -185,28 +185,17 @@ space_new :: proc(
 				key := DOF_Key{conn.conn.vertices[sup.entity_index], sup.entity_dof_index}
 				l2g[dof] = assign_shared_dof(&shared[.D0], key, next_global)
 				signs[dof] = false
-			case .D1:
-				dof_local, flip := basis_orient_dof(
-					bd,
-					.Line,
-					conn.edge_orientations[sup.entity_index],
-					sup.entity_dof_index,
-				)
-				key := DOF_Key{conn.conn.edges[sup.entity_index], dof_local}
-				l2g[dof] = assign_shared_dof(&shared[.D1], key, next_global)
+			case .D1, .D2:
+				ft := Element_Type.Line if sup.entity_dim == .D1 else element_facet_type(bd.element, sup.entity_index)
+				orientation :=
+					conn.edge_orientations[sup.entity_index] if sup.entity_dim == .D1 else conn.face_orientations[sup.entity_index]
+				ent :=
+					conn.conn.edges[sup.entity_index] if sup.entity_dim == .D1 else conn.conn.faces[sup.entity_index]
+				dof_local, flip := basis_orient_dof(bd, ft, orientation, sup.entity_dof_index)
+				key := DOF_Key{ent, dof_local}
+				l2g[dof] = assign_shared_dof(&shared[sup.entity_dim], key, next_global)
 				signs[dof] = flip
-			case .D2:
-				ft := element_facet_type(bd.element, sup.entity_index)
-				dof_local, flip := basis_orient_dof(
-					bd,
-					ft,
-					conn.face_orientations[sup.entity_index],
-					sup.entity_dof_index,
-				)
-				key := DOF_Key{conn.conn.faces[sup.entity_index], dof_local}
-				l2g[dof] = assign_shared_dof(&shared[.D2], key, next_global)
-				signs[dof] = flip
-			case .D3: unreachable() // caught by element dim case.
+			case .D3: unreachable()
 			}
 		}
 	}
@@ -451,17 +440,17 @@ interpolator_next :: proc(
 				sup.entity_dim == element_dim(rule.element),
 				"bug: DOF functional over facet rule, not facet supported.",
 			)
-			geo_basis = bstore_get_facet(geo_bd, sup.entity_index, rule)
+			geo_basis = bstore_facet(geo_bd, sup.entity_index, rule)
 		} else {
-			geo_basis = bstore_get_interior(geo_bd, rule)
+			geo_basis = bstore_interior(geo_bd, rule)
 		}
 
 		coords := space_gather(f64, ip.geometry, ip.ent)
 		ip.phys_points = pvec_create(f64, len(rule.ref_points), POINT_DIMS)
 		ip.jacobians = pvec_create(f64, len(rule.ref_points), JAC_DIMS)
 
-		contract_eval(POINT_DIMS, ip.phys_points, coords, geo_basis[.Scalar])
-		contract_eval(JAC_DIMS, ip.jacobians, coords, geo_basis[.Scalar_Gradient])
+		contract_eval(POINT_DIMS, ip.phys_points, coords, geo_basis[.S_Val])
+		contract_eval(JAC_DIMS, ip.jacobians, coords, geo_basis[.S_Grd])
 
 		ip.current_point = 0
 	}
@@ -476,6 +465,7 @@ interpolator_next :: proc(
 	return jac, point, out, true
 }
 
+// Must be called after interpolation is complete, does not reset the iterator, create new if interpolating again.
 interpolator_flush :: proc(ip: ^Interpolator($A, $I)) {
 	defer scratch_end_temp(ip.temp)
 	if ip.restriction != nil {
@@ -485,28 +475,7 @@ interpolator_flush :: proc(ip: ^Interpolator($A, $I)) {
 	}
 }
 
-
-//== Multi-Space
-
-State_Map :: map[Space_ID][]f64
-
-state_map_for :: proc(spaces: ..^Space, alloc := context.allocator) -> State_Map {
-	stmap := make(map[Space_ID][]f64, alloc)
-	for s in spaces {
-		assert(s.id not_in stmap, "Passed in same space twice.")
-		stmap[s.id] = make([]f64, s.total_coeffs, alloc)
-	}
-	return stmap
-}
-
-state_map_destroy :: proc(s: State_Map) {
-	for k, &v in s { delete(v, s.allocator) }
-	delete(s)
-}
-
-space_vec_from_map :: proc(state_map: State_Map, s: ^Space) -> Space_Vector {
-	return {s, state_map[s.id]}
-}
+//== Constraints
 
 Constraint_Essential :: struct {
 	boundaries: Boundary_Set,
@@ -527,14 +496,25 @@ Constraint :: union {
 	Constraint_Periodic,
 }
 
+
 constraint_essential :: proc(boundary: Boundary_ID, leave_free: bit_set[0 ..< MAX_FIELDS] = {}) -> Constraint {
 	return Constraint_Essential{{boundary}, leave_free}
+}
+
+constraint_periodic :: proc(
+	periodicity: Periodicity,
+	field_transform: Maybe(Dense_Matrix) = nil,
+	leave_free: bit_set[0 ..< MAX_FIELDS] = {},
+) -> Constraint {
+	return Constraint_Periodic{periodicity, field_transform, leave_free}
 }
 
 Constituent_Space :: struct {
 	space:       ^Space,
 	constraints: []Constraint,
 }
+
+//== Multi-Space
 
 Multi_Space :: struct {
 	spaces:           map[Space_ID]^Space,
@@ -543,8 +523,6 @@ Multi_Space :: struct {
 	total_soln_size:  int, // free dofs after elimination
 	dof_map:          []DOF_Map_Entry, // len == total_state_size, flat, global-indexed
 	soln_to_dof:      []int, // soln idx -> global dof idx
-	sparsity:         Sparsity,
-	inhomogeneity:    []f64, // len == total_state_size
 	arena:            virtual.Arena,
 }
 
@@ -575,6 +553,11 @@ Assembly_Mode :: enum {
 	Newton,
 }
 
+// Flat state vector for all spaces in a multi space
+State :: distinct []f64
+
+
+// Combines constituent spaces into one flat dof numbering, applies constraints, and numbers the free dofs.
 ms_create :: proc(mesh: Mesh, spaces: ..Constituent_Space) -> (ms: Multi_Space) {
 	assert(len(spaces) >= 1)
 
@@ -603,18 +586,27 @@ ms_create :: proc(mesh: Mesh, spaces: ..Constituent_Space) -> (ms: Multi_Space) 
 	}
 	ms.total_state_size = offset
 	ms.dof_map = make([]DOF_Map_Entry, ms.total_state_size)
-	ms.inhomogeneity = make([]f64, ms.total_state_size)
 
 	constrained := make([]bool, ms.total_state_size, scratch())
+
+	// Essential constraints first, always - a periodic pairing can never override a Dirichlet dof.
 	for cs, i in spaces {
 		base := ms.ranges[i].base
 		for c in cs.constraints {
-			switch v in c {
-			case Constraint_Essential: mark_essential(mesh, cs.space, base, v, ms.dof_map, constrained)
-			case Constraint_Periodic: mark_periodic(mesh, cs.space, base, v, ms.dof_map, constrained)
-			}
+			if v, ok := c.(Constraint_Essential);
+			   ok { mark_essential(mesh, cs.space, base, v, ms.dof_map, constrained) }
 		}
 	}
+	for cs, i in spaces {
+		base := ms.ranges[i].base
+		for c in cs.constraints {
+			if v, ok := c.(Constraint_Periodic); ok { mark_periodic(mesh, cs.space, base, v, ms.dof_map, constrained) }
+		}
+	}
+
+	// After this, every MPC_Term.dof points at a Free or terminal-essential dof, never another
+	// periodic dof - everything downstream relies on that to resolve in a single hop.
+	flatten_periodic_chains(ms.dof_map)
 
 	soln_idx := 0
 	for gidx in 0 ..< ms.total_state_size {
@@ -631,8 +623,6 @@ ms_create :: proc(mesh: Mesh, spaces: ..Constituent_Space) -> (ms: Multi_Space) 
 	for gidx in 0 ..< ms.total_state_size {
 		if ms.dof_map[gidx].role == .Free { ms.soln_to_dof[ms.dof_map[gidx].soln_index] = gidx }
 	}
-
-	ms_build_sparsity(&ms)
 
 	return ms
 
@@ -651,6 +641,7 @@ ms_create :: proc(mesh: Mesh, spaces: ..Constituent_Space) -> (ms: Multi_Space) 
 				for field in 0 ..< space.fields {
 					if field in c.leave_free { continue }
 					gidx := base + int(dof) * space.fields + field
+					if constrained[gidx] { continue } 	// first essential write wins
 					dof_map[gidx] = {
 						role = .Constrained,
 					}
@@ -669,7 +660,6 @@ ms_create :: proc(mesh: Mesh, spaces: ..Constituent_Space) -> (ms: Multi_Space) 
 		dof_map: []DOF_Map_Entry,
 		constrained: []bool,
 	) {
-
 		Facet_Dof_Key :: struct {
 			dim:   Dimension,
 			ent:   int,
@@ -686,8 +676,7 @@ ms_create :: proc(mesh: Mesh, spaces: ..Constituent_Space) -> (ms: Multi_Space) 
 			assert(len(master_dofs) == len(slave_dofs), "periodic pair facets have mismatched dof counts")
 
 			et := mesh.facets[pair.master].info.type
-			bd_facet := Basis_Desc{et, space.family, space.order} // only used for its basis_support order,
-			// which space_facet_dofs' own ordering (via basis_facet_restriction / space_l2g) matches.
+			bd_facet := Basis_Desc{et, space.family, space.order}
 
 			master_cell, _ := facet_canonical_cell(mesh, mesh.facets[pair.master])
 			bd_cell := Basis_Desc{master_cell.type, space.family, space.order}
@@ -716,7 +705,6 @@ ms_create :: proc(mesh: Mesh, spaces: ..Constituent_Space) -> (ms: Multi_Space) 
 					)
 					sldof = slave_flat[{.D1, pair.edge_map[sup.entity_index], canonical}]
 					sign = -1.0 if flip else 1.0
-
 				case .D2, .D3: unreachable()
 				case: unreachable()
 				}
@@ -725,7 +713,7 @@ ms_create :: proc(mesh: Mesh, spaces: ..Constituent_Space) -> (ms: Multi_Space) 
 					if field in c.leave_free { continue }
 
 					sgidx := base + int(slave_dofs[sldof]) * space.fields + field
-					if constrained[sgidx] { continue } 	// already tied by an earlier pair, e.g. a shared corner
+					if constrained[sgidx] { continue } 	// already tied (by essential, or an earlier pair)
 
 					terms: []MPC_Term
 					if has_xform {
@@ -750,12 +738,132 @@ ms_create :: proc(mesh: Mesh, spaces: ..Constituent_Space) -> (ms: Multi_Space) 
 			}
 		}
 	}
+
+	flatten_periodic_chains :: proc(dof_map: []DOF_Map_Entry) {
+		scratch_guard()
+		resolved := make([]bool, len(dof_map), scratch())
+		visiting := make([]bool, len(dof_map), scratch())
+
+		flatten_one :: proc(dof_map: []DOF_Map_Entry, resolved, visiting: []bool, gidx: int) {
+			entry := &dof_map[gidx]
+			if entry.role != .Constrained || entry.terms == nil || resolved[gidx] { return } 	// free / essential leaf / done
+			assert(
+				!visiting[gidx],
+				"cyclic periodic constraint (two dofs periodically defined in terms of each other)",
+			)
+			visiting[gidx] = true
+
+			flat := make([dynamic]MPC_Term, 0, len(entry.terms))
+			for term in entry.terms {
+				target := dof_map[term.dof]
+				if target.role == .Free || target.terms == nil {
+					append(&flat, term) // already terminal
+				} else {
+					flatten_one(dof_map, resolved, visiting, term.dof)
+					for inner in dof_map[term.dof].terms {
+						append(&flat, MPC_Term{inner.dof, inner.weight * term.weight})
+					}
+				}
+			}
+			entry.terms = flat[:]
+			visiting[gidx] = false
+			resolved[gidx] = true
+		}
+
+		for gidx in 0 ..< len(dof_map) { flatten_one(dof_map, resolved, visiting, gidx) }
+	}
 }
 
-ms_state :: proc(ms: Multi_Space, alloc := context.allocator) -> (stmap: State_Map) {
-	stmap = make(State_Map, alloc)
-	for key, val in ms.spaces { stmap[key] = make([]f64, val.total_coeffs, alloc) }
-	return stmap
+// Allocates fresh state buffer
+ms_state_alloc :: proc(ms: Multi_Space, alloc := context.allocator) -> State {
+	return make(State, ms.total_state_size, alloc)
+}
+
+// Returns the raw coefficient slice for `space` out of a flat State buffer.
+ms_state_slice :: proc(ms: Multi_Space, state: State, space: Space_ID) -> []f64 {
+	r := ms_space_range(ms, space)
+	return cast([]f64)state[r.base:r.end]
+}
+
+// Returns the (space, coeffs) view for `space` out of state.
+ms_space_vec :: proc(ms: Multi_Space, state: State, space: ^Space) -> Space_Vector {
+	return {space, ms_state_slice(ms, state, space.id)}
+}
+
+// Re-derives every constrained dof's value in `state` from `inhom` and its MPC terms.
+ms_enforce_constraints :: proc(ms: Multi_Space, state: State, inhom: State) {
+	rank_sync()
+	for r in ms.ranges {
+		sub := rank_range(r.end - r.base)
+		for gidx in r.base + sub.min ..< r.base + sub.max {
+			entry := ms.dof_map[gidx]
+			if entry.role != .Constrained { continue }
+
+			val := inhom[gidx]
+			for term in entry.terms { val += term.weight * dof_value(ms, state, inhom, term.dof) }
+			state[gidx] = val
+		}
+	}
+	rank_sync()
+
+	dof_value :: proc(ms: Multi_Space, state, inhom: State, gidx: int) -> f64 {
+		entry := ms.dof_map[gidx]
+		if entry.role == .Free { return state[gidx] }
+		return inhom[gidx] // essential leaf
+	}
+}
+
+// Allocates a vector sized for the free dofs only.
+ms_soln_vector :: proc(ms: Multi_Space, alloc := context.allocator) -> Vector {
+	return make(Vector, ms.total_soln_size, alloc)
+}
+
+// Applies state += update to the free dofs, then re-derives constrained dofs.
+ms_apply_update :: proc(ms: Multi_Space, state: State, inhom: State, update: Vector) {
+	for r in ms.ranges {
+		sub := rank_range(r.end - r.base)
+		for gidx in r.base + sub.min ..< r.base + sub.max {
+			entry := ms.dof_map[gidx]
+			if entry.role != .Free { continue }
+			state[gidx] += update[entry.soln_index]
+		}
+	}
+	ms_enforce_constraints(ms, state, inhom)
+}
+
+// Applies state = soln to the free dofs, then re-derives constrained dofs.
+ms_apply_soln :: proc(ms: Multi_Space, state: State, inhom: State, soln: Vector) {
+	for r in ms.ranges {
+		sub := rank_range(r.end - r.base)
+		for gidx in r.base + sub.min ..< r.base + sub.max {
+			entry := ms.dof_map[gidx]
+			if entry.role != .Free { continue }
+			state[gidx] = soln[entry.soln_index]
+		}
+	}
+	ms_enforce_constraints(ms, state, inhom)
+}
+
+// Construct an amgcl-conforming representation of the near nullspace from the given State vectors,
+// Only free dofs are included, matching the reduced system actually solved.
+ms_near_null_space :: proc(ms: Multi_Space, vectors: ..State, alloc := context.allocator) -> (nns: []f64, cols: int) {
+	cols = len(vectors)
+	nns = make([]f64, ms.total_soln_size * cols, alloc)
+
+	for r in ms.ranges {
+		for gidx in r.base ..< r.end {
+			entry := ms.dof_map[gidx]
+			if entry.role != .Free { continue }
+			for v, col in vectors { nns[entry.soln_index * cols + col] = v[gidx] }
+		}
+	}
+
+	return
+}
+
+// Frees the multi space's arena.
+ms_destroy :: proc(ms: ^Multi_Space) {
+	virtual.arena_destroy(&ms.arena)
 }
 
 @(private)
@@ -764,221 +872,191 @@ ms_space_range :: proc(ms: Multi_Space, id: Space_ID) -> Space_Range {
 	panic("space not in multi space")
 }
 
-ms_inhomogeneity :: proc(ms: Multi_Space, space: Space_ID) -> []f64 {
-	r := ms_space_range(ms, space)
-	return ms.inhomogeneity[r.base:r.end]
+//== Sys
+
+Coupling :: struct {
+	test, trial: Space_ID,
 }
 
-// Ensures coeffs in state for all spaces in the multi space satisfy the set constraints.
-ms_enforce_constraints :: proc(ms: Multi_Space, state: State_Map) {
-	for r in ms.ranges {
-		local_state := state[r.id]
-		for gidx in r.base ..< r.end {
-			entry := ms.dof_map[gidx]
-			if entry.role != .Constrained { continue }
+Sys :: struct {
+	ms:            Multi_Space,
+	couplings:     []Coupling,
+	couplings_set: map[Coupling]bool,
+	sparsity:      Sparsity,
+	arena:         virtual.Arena,
+}
 
-			val := ms.inhomogeneity[gidx]
-			for term in entry.terms { val += term.weight * ms_read(ms, state, term.dof) }
-			local_state[gidx - r.base] = val
+// Builds the sparsity pattern for exactly the declared (test, trial) couplings
+// For a fully-coupled 2-variable problem (u, p), pass all four: {u,u}, {u,p}, {p,u}, {p,p}.
+sys_create :: proc(ms: Multi_Space, couplings: ..Coupling) -> (sys: Sys) {
+	assert(len(couplings) >= 1)
+
+	virtual.arena_init_growing(&sys.arena) or_else panic("Failed to create arena")
+	context.allocator = virtual.arena_allocator(&sys.arena)
+
+	sys.ms = ms
+	sys.couplings = make([]Coupling, len(couplings))
+	copy(sys.couplings, couplings)
+
+	sys.couplings_set = make(map[Coupling]bool, len(couplings))
+	for c in couplings { sys.couplings_set[c] = true }
+
+	build_sparsity(&sys)
+
+	return sys
+
+	build_sparsity :: proc(sys: ^Sys) {
+		Pair :: struct {
+			row, col: i32,
+		}
+
+		scratch_guard()
+		context.allocator = virtual.arena_allocator(&sys.arena)
+
+		pairs := make([dynamic]Pair, scratch())
+		row_touched := make([dynamic]int, scratch())
+		col_touched := make([dynamic]int, scratch())
+
+		entity_count := len(sys.ms.spaces[sys.ms.ranges[0].id].numbering.l2g)
+
+		for c in sys.couplings {
+			test_space := sys.ms.spaces[c.test]
+			trial_space := sys.ms.spaces[c.trial]
+			test_base := ms_space_range(sys.ms, c.test).base
+			trial_base := ms_space_range(sys.ms, c.trial).base
+
+			for e in 0 ..< entity_count {
+				clear(&row_touched)
+				clear(&col_touched)
+
+				if t_l2g := test_space.numbering.l2g[e]; t_l2g != nil {
+					for gdof in t_l2g {
+						for field in 0 ..< test_space.fields {
+							gidx := test_base + int(gdof) * test_space.fields + field
+							sys_collect_free(sys.ms, gidx, &row_touched)
+						}
+					}
+				}
+				if r_l2g := trial_space.numbering.l2g[e]; r_l2g != nil {
+					for gdof in r_l2g {
+						for field in 0 ..< trial_space.fields {
+							gidx := trial_base + int(gdof) * trial_space.fields + field
+							sys_collect_free(sys.ms, gidx, &col_touched)
+						}
+					}
+				}
+
+				for a in row_touched {
+					for b in col_touched { append(&pairs, Pair{i32(a), i32(b)}) }
+				}
+			}
+		}
+
+		slice.sort_by(pairs[:], proc(a, b: Pair) -> bool {
+			if a.row != b.row { return a.row < b.row }
+			return a.col < b.col
+		})
+
+		row_ptrs := make([]i32, sys.ms.total_soln_size + 1)
+		columns := make([dynamic]i32)
+
+		row := i32(0)
+		for p, i in pairs {
+			if i > 0 && p == pairs[i - 1] { continue }
+			for row < p.row {
+				row += 1
+				row_ptrs[row] = i32(len(columns))
+			}
+			append(&columns, p.col)
+		}
+		for row < i32(sys.ms.total_soln_size) {
+			row += 1
+			row_ptrs[row] = i32(len(columns))
+		}
+
+		sys.sparsity = {
+			row_ptrs = row_ptrs,
+			columns  = columns[:],
 		}
 	}
 
-	ms_read :: proc(ms: Multi_Space, state: State_Map, gidx: int) -> f64 {
-		for r in ms.ranges {
-			if gidx >= r.base && gidx < r.end { return state[r.id][gidx - r.base] }
-		}
-		panic("gidx out of range")
-	}
-}
-
-ms_soln_vector :: proc(ms: Multi_Space, alloc := context.allocator) -> Vector {
-	return make(Vector, ms.total_soln_size, alloc)
-}
-
-ms_soln_matrix :: proc(ms: Multi_Space, alloc := context.allocator) -> Sparse_Matrix {
-	return sp_from_sparsity(ms.sparsity, alloc)
-}
-
-// Returns two soln vectors and a matrix for convienence
-ms_problem_data :: proc(ms: Multi_Space, alloc := context.allocator) -> (Vector, Vector, Sparse_Matrix) {
-	return ms_soln_vector(ms, alloc), ms_soln_vector(ms, alloc), ms_soln_matrix(ms, alloc)
-}
-
-// Applies state += update, updates free dofs and re-enforces constraints.
-ms_apply_update :: proc(ms: Multi_Space, state: State_Map, update: Vector) {
-	for r in ms.ranges {
-		local_state := state[r.id]
-		for gidx in r.base ..< r.end {
-			entry := ms.dof_map[gidx]
-			if entry.role != .Free { continue }
-			local_state[gidx - r.base] += update[entry.soln_index]
-		}
-	}
-	ms_enforce_constraints(ms, state)
-}
-
-// Applies state = soln, updates free dofs and re-enforces constraints.
-ms_apply_soln :: proc(ms: Multi_Space, state: State_Map, soln: Vector) {
-	for r in ms.ranges {
-		local_state := state[r.id]
-		for gidx in r.base ..< r.end {
-			entry := ms.dof_map[gidx]
-			if entry.role != .Free { continue }
-			local_state[gidx - r.base] = soln[entry.soln_index]
-		}
-	}
-	ms_enforce_constraints(ms, state)
-}
-
-ms_destroy :: proc(ms: ^Multi_Space) {
-	virtual.arena_destroy(&ms.arena)
-}
-
-@(private)
-ms_build_sparsity :: proc(ms: ^Multi_Space) {
-	Pair :: struct {
-		row, col: i32,
-	}
-
-	touch :: proc(ms: ^Multi_Space, touched: ^[dynamic]int, gidx: int) {
+	sys_collect_free :: proc(ms: Multi_Space, gidx: int, touched: ^[dynamic]int) {
 		entry := ms.dof_map[gidx]
 		if entry.role == .Free {
 			append(touched, entry.soln_index)
 			return
 		}
-		for term in entry.terms { touch(ms, touched, term.dof) }
-	}
-
-	scratch_guard()
-	context.allocator = virtual.arena_allocator(&ms.arena)
-
-	pairs := make([dynamic]Pair, scratch())
-	touched := make([dynamic]int, scratch())
-
-	entity_count := len(ms.spaces[ms.ranges[0].id].numbering.l2g)
-
-	for e in 0 ..< entity_count {
-		clear(&touched)
-		for r in ms.ranges {
-			space := ms.spaces[r.id]
-			l2g := space.numbering.l2g[e]
-			if l2g == nil { continue }
-
-			for gdof in l2g {
-				for field in 0 ..< space.fields {
-					gidx := r.base + int(gdof) * space.fields + field
-					touch(ms, &touched, gidx)
-				}
-			}
-		}
-
-		for a in touched {
-			for b in touched { append(&pairs, Pair{i32(a), i32(b)}) }
+		for term in entry.terms {
+			target := ms.dof_map[term.dof]
+			if target.role == .Free { append(touched, target.soln_index) }
 		}
 	}
-
-	slice.sort_by(pairs[:], proc(a, b: Pair) -> bool {
-		if a.row != b.row { return a.row < b.row }
-		return a.col < b.col
-	})
-
-	row_ptrs := make([]i32, ms.total_soln_size + 1)
-	columns := make([dynamic]i32)
-
-	row := i32(0)
-	for p, i in pairs {
-		if i > 0 && p == pairs[i - 1] { continue }
-		for row < p.row {
-			row += 1
-			row_ptrs[row] = i32(len(columns))
-		}
-		append(&columns, p.col)
-	}
-	for row < i32(ms.total_soln_size) {
-		row += 1
-		row_ptrs[row] = i32(len(columns))
-	}
-
-	ms.sparsity = {row_ptrs = row_ptrs, columns = columns[:]}
 }
 
-@(private)
-ms_distribute_vec :: proc(ms: Multi_Space, vec: Vector, gidx: int, val: f64) {
-	entry := ms.dof_map[gidx]
-	if entry.role == .Free {
-		vec[entry.soln_index] += val
-		return
-	}
-	for term in entry.terms { ms_distribute_vec(ms, vec, term.dof, val * term.weight) }
+// Allocates a sparse matrix with the sparsity pattern of system
+sys_soln_matrix :: proc(sys: Sys, alloc := context.allocator) -> Sparse_Matrix {
+	return sp_from_sparsity(sys.sparsity, alloc)
 }
 
-ms_scatter_vec :: proc(ms: Multi_Space, vec: Vector, local: Cvec($T), test: Space_ID, ent: Entity_ID) {
-	space := ms.spaces[test]
+// Adds a local element vector for `test` at entity `ent` into the reduced global vector `vec`.
+sys_scatter_vec :: proc(sys: Sys, vec: Vector, local: Cvec($T), test: Space_ID, ent: Entity_ID) {
+	space := sys.ms.spaces[test]
 	l2g := space_l2g(space, ent)
 	assert(len(l2g) == local.dofs)
 	assert(local.fields == space.fields)
 
-	base := ms_space_range(ms, test).base
+	base := ms_space_range(sys.ms, test).base
+
+	scratch_guard()
+	touched := make([dynamic]int, scratch())
 
 	for gdof, ldof in l2g {
 		sign := space_dof_sign(space, ent, ldof)
 		lblock := cvec_dof_block(local, ldof)
 		for field in 0 ..< local.fields {
 			gidx := base + int(gdof) * space.fields + field
-			ms_distribute_vec(ms, vec, gidx, cast(f64)lblock[field] * sign)
+			val := cast(f64)lblock[field] * sign
+
+			clear(&touched)
+			entry := sys.ms.dof_map[gidx]
+			if entry.role == .Free {
+				vec[entry.soln_index] += val
+			} else {
+				for term in entry.terms {
+					target := sys.ms.dof_map[term.dof]
+					if target.role == .Free { vec[target.soln_index] += val * term.weight }
+				}
+			}
 		}
 	}
 }
 
-
-@(private)
-ms_distribute_mat :: proc(
-	ms: Multi_Space,
+// Adds a local element matrix for (test, trial) at entity `ent` into `mat`. Linear mode lifts
+// constrained columns into `load` using `inhom`, Newton mode ignores both. test and trial must have
+// been declared couplings.
+sys_scatter_mat :: proc(
+	sys: Sys,
 	mat: Sparse_Matrix,
 	load: Vector,
-	mode: Assembly_Mode,
-	grow, gcol: int,
-	val: f64,
-) {
-	rentry := ms.dof_map[grow]
-	if rentry.role == .Constrained {
-		for term in rentry.terms { ms_distribute_mat(ms, mat, load, mode, term.dof, gcol, val * term.weight) }
-		return
-	}
-
-	centry := ms.dof_map[gcol]
-	if centry.role == .Constrained {
-		for term in centry.terms { ms_distribute_mat(ms, mat, load, mode, grow, term.dof, val * term.weight) }
-		if mode == .Linear { load[rentry.soln_index] -= val * ms.inhomogeneity[gcol] }
-		return
-	}
-
-	p := sp_get(mat, rentry.soln_index, centry.soln_index)
-	assert(p != nil, "column not found in sparsity pattern for row")
-	p^ += val
-}
-
-ms_scatter_mat :: proc(
-	ms: Multi_Space,
-	mat: Sparse_Matrix,
-	load: Vector,
+	inhom: State,
 	mode: Assembly_Mode,
 	local: Cmat($T),
 	test, trial: Space_ID,
 	ent: Entity_ID,
 ) {
 	assert(mode == .Newton || load != nil, "Linear mode needs a load vector to move constrained columns into")
+	assert(Coupling{test, trial} in sys.couplings_set, "(test, trial) pair was not declared in sys_create")
 
-	tspace := ms.spaces[test]
-	rspace := ms.spaces[trial]
+	tspace := sys.ms.spaces[test]
+	rspace := sys.ms.spaces[trial]
 
 	rows := space_l2g(tspace, ent)
 	cols := space_l2g(rspace, ent)
 	assert(len(rows) == local.row_dofs && len(cols) == local.col_dofs)
 	assert(local.row_fields == tspace.fields && local.col_fields == rspace.fields)
 
-	tbase := ms_space_range(ms, test).base
-	rbase := ms_space_range(ms, trial).base
+	tbase := ms_space_range(sys.ms, test).base
+	rbase := ms_space_range(sys.ms, trial).base
 
 	for rgdof, rldof in rows {
 		rsign := space_dof_sign(tspace, ent, rldof)
@@ -992,9 +1070,42 @@ ms_scatter_mat :: proc(
 				for cf in 0 ..< local.col_fields {
 					gcol := rbase + int(cgdof) * rspace.fields + cf
 					val := cast(f64)block[rf * local.col_fields + cf] * sign
-					ms_distribute_mat(ms, mat, load, mode, grow, gcol, val)
+					distribute(sys.ms, mat, load, inhom, mode, grow, gcol, val)
 				}
 			}
 		}
 	}
+
+	// Row/col are each at most one hop from end due to flattening, so no infinite recursion concerns.
+	distribute :: proc(
+		ms: Multi_Space,
+		mat: Sparse_Matrix,
+		load: Vector,
+		inhom: State,
+		mode: Assembly_Mode,
+		grow, gcol: int,
+		val: f64,
+	) {
+		rentry := ms.dof_map[grow]
+		if rentry.role == .Constrained {
+			for term in rentry.terms { distribute(ms, mat, load, inhom, mode, term.dof, gcol, val * term.weight) }
+			return
+		}
+
+		centry := ms.dof_map[gcol]
+		if centry.role == .Constrained {
+			for term in centry.terms { distribute(ms, mat, load, inhom, mode, grow, term.dof, val * term.weight) }
+			if mode == .Linear { load[rentry.soln_index] -= val * inhom[gcol] }
+			return
+		}
+
+		p := sp_get(mat, rentry.soln_index, centry.soln_index)
+		assert(p != nil, "column not found in sparsity pattern for row")
+		p^ += val
+	}
+}
+
+// Frees the sys's arena. Does not affect the Multi_Space it was built from.
+sys_destroy :: proc(sys: ^Sys) {
+	virtual.arena_destroy(&sys.arena)
 }

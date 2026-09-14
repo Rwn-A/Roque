@@ -38,9 +38,9 @@ Solver_Kind :: enum c.int {
 }
 
 SA_Extra :: struct {
-	block_size:    c.int,
-	coarse_enough: c.int,
-	near_null_space:     [^]c.double,
+	block_size:           c.int,
+	coarse_enough:        c.int,
+	near_null_space:      [^]c.double,
 	near_null_space_cols: c.int,
 }
 
@@ -177,17 +177,20 @@ fgmres_params :: proc(tolerance := 1e-8, max_iters := 500, gmres_m := 30, verbos
 }
 
 // Creates the preconditioner for the given matrix.
-amgcl_precond_create :: proc(m: Sparse_Matrix, params: Precond_Params = SA_DEFAULT) -> (precond: ^Precond, success: bool) {
+amgcl_precond_create :: proc(
+	m: Sparse_Matrix,
+	params: Precond_Params = SA_DEFAULT,
+) -> (
+	precond: ^Precond,
+	success: bool,
+) {
 	n := sp_rows(m)
 	assert(n > 0, "row_ptrs must have at least 2 entries")
 	assert(len(m.columns) == int(m.row_ptrs[n]), "columns length must match row_ptrs[n]")
 	assert(len(m.values) == len(m.columns), "values length must match columns length")
 	p := params
 	if p.kind == .SA && p.extra.sa.near_null_space != nil {
-		assert(
-			p.extra.sa.near_null_space_cols > 0,
-			"near_null_space was set but near_null_space_cols is 0 -- did you forget to set it?",
-		)
+		assert(p.extra.sa.near_null_space_cols > 0, "near_null_space was set but near_null_space_cols is 0.")
 	}
 	precond = _precond_create(
 		c.int(n),
@@ -217,12 +220,9 @@ amgcl_solve :: proc(p: ^Precond, rhs, x: Vector, params: Solver_Params = CG_DEFA
 	rc := solve_raw(p, cast([^]c.double)raw_data(rhs), cast([^]c.double)raw_data(x), &sp, &iters, &residual)
 	status: Solve_Status
 	switch rc {
-	case 0:
-		status = .Converged
-	case 1:
-		status = .Not_Converged
-	case:
-		status = .Error
+	case 0: status = .Converged
+	case 1: status = .Not_Converged
+	case: status = .Error
 	}
 	return Solve_Result{status = status, iters = int(iters), residual = f64(residual)}
 }

@@ -98,7 +98,7 @@ vtu_output_writer :: proc(
 			element    = cell.type,
 		}
 
-		basis := fe.bstore_get_interior(fe.space_bd(coord_space, cell.type), rule)
+		basis := fe.bstore_interior(fe.space_bd(coord_space, cell.type), rule)
 		elem_coords := fe.space_gather(f64, {coord_space, coords}, cell.id, context.temp_allocator)
 
 		phys_points := fe.pvec_create(
@@ -110,9 +110,9 @@ vtu_output_writer :: proc(
 
 		// Because contractions need compile-time dims
 		switch coord_space.fields {
-		case 1: fe.contract_eval({.CMPNTS = 1, .FIELDS = 1}, phys_points, elem_coords, basis[.Scalar])
-		case 2: fe.contract_eval({.CMPNTS = 1, .FIELDS = 2}, phys_points, elem_coords, basis[.Scalar])
-		case 3: fe.contract_eval({.CMPNTS = 1, .FIELDS = 3}, phys_points, elem_coords, basis[.Scalar])
+		case 1: fe.contract_eval({.CMPNTS = 1, .FIELDS = 1}, phys_points, elem_coords, basis[.S_Val])
+		case 2: fe.contract_eval({.CMPNTS = 1, .FIELDS = 2}, phys_points, elem_coords, basis[.S_Val])
+		case 3: fe.contract_eval({.CMPNTS = 1, .FIELDS = 3}, phys_points, elem_coords, basis[.S_Val])
 		case: unreachable()
 		}
 
@@ -145,6 +145,8 @@ vtu_output_writer :: proc(
 }
 
 vtu_write :: proc(w: ^VTU_Writer, req: Write_Request) -> bool {
+	if fe.rank_count() != 1 {panic("Tried to write file from multiple threads at once.")}
+
 	if len(req.fields) == 0 {
 		log.warnf("Nothing to output: Not writing to %s", req.path); return false
 	}

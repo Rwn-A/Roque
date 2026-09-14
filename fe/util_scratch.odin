@@ -14,7 +14,7 @@ import "core:mem/virtual"
 
 // TODO: replace with bespoke implementation that doenst have a mutex we dont need thread safety here.
 
-Scratch_Temp :: virtual.Arena_Temp
+Scratch_Temp  :: virtual.Arena_Temp
 Scratch_Arena :: virtual.Arena
 
 @(thread_local, private)
@@ -28,7 +28,7 @@ scratch_used :: proc() -> uint {
 	return _scratch_arena.total_used
 }
 
-scratch_begin_temp :: proc() ->  Scratch_Temp {
+scratch_begin_temp :: proc() -> Scratch_Temp {
 	return virtual.arena_temp_begin(scratch_arena())
 }
 
@@ -44,7 +44,7 @@ scratch_guard :: proc() -> Scratch_Temp {
 
 @(private)
 scratch_arena :: proc() -> ^Scratch_Arena {
-	if _scratch_arena == {} { // lazy setup
+	if _scratch_arena == {} { 	// lazy setup
 		if err := virtual.arena_init_growing(&_scratch_arena); err != nil { panic("failed to init scratch arena") }
 		runtime.add_thread_local_cleaner(proc "contextless" () {
 			context = runtime.default_context()
