@@ -1069,7 +1069,7 @@ sys_scatter_mat :: proc(
 				grow := tbase + int(rgdof) * tspace.fields + rf
 				for cf in 0 ..< local.col_fields {
 					gcol := rbase + int(cgdof) * rspace.fields + cf
-					val := cast(f64)block[rf * local.col_fields + cf] * sign
+					val := cast(f64)block[cf * local.row_fields + rf] * sign
 					distribute(sys.ms, mat, load, inhom, mode, grow, gcol, val)
 				}
 			}

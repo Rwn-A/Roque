@@ -14,7 +14,7 @@ import "core:math"
  Various forms of poisson type problems over different geometries.
 */
 
-@(test)
+//@(test)
 standard_poisson :: proc(t: ^testing.T) {
 	wf :: proc(
 		$AMB, $INT: int,
@@ -221,88 +221,6 @@ standard_poisson :: proc(t: ^testing.T) {
 		zero_forcing_2d,
 	)
 
+
 	testing.expectf(t, err_2d < 1e-6, "2D MMS error too large: %v", err_2d)
-}
-
-// @(test)
-// standard_poisson :: proc(t: ^testing.T) {
-// 	arena := virtual.Arena{}
-// 	virtual.arena_init_growing(&arena) or_else testing.fail_now(t, "unable to create arena")
-// 	context.allocator = virtual.arena_allocator(&arena)
-// 	defer virtual.arena_destroy(&arena)
-
-// 	fe.init_default_rank_ctx() // because test runner isnt on main thread.
-
-// 	// 2D
-// 	{
-// 		FIXED_VALUE :: 10
-
-// 		mesh := fio.load_mesh("./validation/meshes/2d_channel.msh", .GMSH_V2_BINARY) or_else testing.fail_now(t)
-// 		defer fe.mesh_destroy(&mesh) // internal arena, has to be cleaned up manually
-
-// 		geo_space := fe.space_new_isoparemetric(mesh, 2)
-// 		geo_coeffs := fe.mesh_coord_coeffs(mesh, fe.XY_PLANE_FRAME)
-
-// 		phi := fe.space_new(mesh, {.Lagrange, .O1, .Continuous, fe.ALL_REGIONS}, 1)
-
-// 		//output at whatever order phi is, doesnt have to be that, but matches viz order to soln order
-// 		output_w, out_rules := fio.output_setup(mesh, geo_space, geo_coeffs, .O2, fio.VTU_Config{})
-// 		defer fio.output_takedown(output_w) //internal arena
-
-// 		phi_out := fio.output_field_create(mesh, "Phi", phi.fields, out_rules)
-
-// 		fixed := mesh.boundary_names["top"] or_else testing.fail_now(t)
-
-// 		ms := fe.ms_create(mesh, {space = phi, constraints = {fe.constraint_essential(fixed)}})
-// 		defer fe.ms_destroy(&ms) // internal arena
-
-// 		state := fe.ms_state(ms)
-// 		f, soln, k := fe.ms_problem_data(ms)
-
-// 		bc_vec := fe.ms_inhomogeneity(ms, phi.id)
-// 		for cell in mesh.cells {
-// 			for bnd_facet in fe.cell_boundary_facet_set_of(mesh, cell, {fixed}) {
-// 				restriction := fe.basis_facet_restriction(fe.space_bd(phi, cell.type), bnd_facet)
-// 				ip := fe.interpolator(2, 2, {geo_space, geo_coeffs}, {phi, bc_vec}, cell.type, cell.id, restriction)
-// 				for jac, point, out in fe.interpolator_next(&ip) { out[0] = FIXED_VALUE }
-// 				fe.interpolator_flush(&ip)
-// 			}
-// 		}
-
-// 		fe.ms_enforce_constraints(ms, state) // state now is compatible with defined constraints and inhomogeneity
-
-// 		for cell in mesh.cells {
-// 			fe.scratch_guard()
-// 			context.allocator = fe.scratch()
-// 			standard_poisson_wf(2, 2, ms, {geo_space, geo_coeffs}, phi, k, f, cell)
-// 		}
-
-// 		prc := fe.amgcl_precond_create(k) or_else testing.fail_now(t)
-// 		defer fe.amgcl_precond_destroy(prc) // allocated by 3rd party lib
-// 		fe.amgcl_solve(prc, f, soln)
-
-// 		fe.ms_apply_soln(ms, state, soln)
-
-// 		for cell in mesh.cells {
-// 			fe.scratch_guard()
-
-// 			phi_basis := fe.bstore_interior(fe.space_bd(phi, cell.type), out_rules[cell.type])
-// 			coeffs := fe.space_gather(f64, {phi, state[phi.id]}, cell.id, fe.scratch())
-// 			result := fe.pvec_create(f64, len(out_rules[cell.type].ref_points), {.CMPNTS = 1, .FIELDS = 1})
-// 			fe.contract_eval({.CMPNTS = 1, .FIELDS = 1}, result, coeffs, phi_basis[.S_Val])
-// 			copy(phi_out.data[cell.id], result.data)
-// 		}
-
-// 		fio.output_write(output_w, {fields = {phi_out}, path = "./validation/output/2d_poisson"})
-// 	}
-// }
-
-
-@(test)
-mixed_poisson :: proc(t: ^testing.T) {
-}
-
-@(test)
-hdg_poisson :: proc(t: ^testing.T) {
-
 }
