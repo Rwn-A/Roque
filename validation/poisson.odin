@@ -21,7 +21,7 @@ standard_poisson_wf :: proc(
 	f: fe.Vector,
 	cell: fe.Cell,
 ) {
-	quad := fe.element_quad_rule(cell.type, .Q3)
+	quad := fe.basis_infer_quad(fe.space_bd(phi, cell.type))
 	n_p := len(quad.ref_points)
 
 	GR_DIMS :: fe.Contraction_Dims {
@@ -34,7 +34,7 @@ standard_poisson_wf :: proc(
 	} // lagrange is scalar-valued space, only one field
 
 	DIFFUSIVITY :: 10 // arbitrary material prop
-	FORCE :: -4 //arbitrary forcing term
+	FORCE :: -10 //arbitrary forcing term
 
 	geo_basis := fe.bstore_get_interior(fe.space_bd(geo, cell.type), quad)
 	geo_coeffs := fe.space_gather(f64, geo, cell.id)
@@ -50,6 +50,7 @@ standard_poisson_wf :: proc(
 
 	// move grads to physical space, values are scalar so they dont transform between spaces.
 	phys_grads := fe.frame_push_bvec(phi_basis[.Scalar_Gradient], j_inv_t)
+
 
 	l_load := fe.space_cvec(f64, phi, cell.type)
 	l_stiffness := fe.space_cmat(f64, phi, phi, cell.type, cell.type)
@@ -72,6 +73,7 @@ standard_poisson_wf :: proc(
 	fe.contract_linear(VL_DIMS, l_load, phi_basis[.Scalar], force)
 	fe.contract_bilinear(GR_DIMS, GR_DIMS, l_stiffness, phys_grads, diffusivity, phys_grads)
 
+
 	fe.ms_scatter_mat(ms, k, f, .Linear, l_stiffness, phi.id, phi.id, cell.id)
 	fe.ms_scatter_vec(ms, f, l_load, phi.id, cell.id)
 }
@@ -87,7 +89,7 @@ standard_poisson :: proc(t: ^testing.T) {
 	{
 		FIXED_VALUE :: 10
 
-		mesh := fio.load_mesh("./validation/meshes/2d_channel.msh", .GMSH_V2_BINARY) or_else testing.fail_now(t)
+		mesh := fio.load_mesh("./validation/meshes/2d_square.msh", .GMSH_V2_BINARY) or_else testing.fail_now(t)
 		defer fe.mesh_destroy(&mesh) // internal arena, has to be cleaned up manually
 
 		geo_space := fe.space_new_isoparemetric(mesh, 2)
@@ -96,17 +98,14 @@ standard_poisson :: proc(t: ^testing.T) {
 		phi := fe.space_new(mesh, {.Lagrange, .O1, .Continuous, fe.ALL_REGIONS}, 1)
 
 		//output at whatever order phi is, doesnt have to be that, but matches viz order to soln order
-		output_w, out_rules := fio.output_setup(mesh, geo_space, geo_coeffs, phi.order, fio.VTU_Config{})
+		output_w, out_rules := fio.output_setup(mesh, geo_space, geo_coeffs, .O2, fio.VTU_Config{})
 		defer fio.output_takedown(output_w) //internal arena
 
 		phi_out := fio.output_field_create(mesh, "Phi", phi.fields, out_rules)
 
-		fixed := mesh.boundary_names["top"]
-		periodic := fe.Constraint_Periodic{
-			periodicity = fe.mesh_periodicity_from_names(mesh, "left", "right") or_else testing.fail_now(t)
-		}
+		fixed := mesh.boundary_names["top"] or_else testing.fail_now(t)
 
-		ms := fe.ms_create(mesh, {space = phi, constraints = {fe.constraint_essential(fixed), periodic}} )
+		ms := fe.ms_create(mesh, {space = phi, constraints = {fe.constraint_essential(fixed)}} )
 		defer fe.ms_destroy(&ms) // internal arena
 
 		state := fe.ms_state(ms)
@@ -117,7 +116,7 @@ standard_poisson :: proc(t: ^testing.T) {
 			for bnd_facet in fe.cell_boundary_facet_set_of(mesh, cell, {fixed}) {
 				restriction := fe.basis_facet_restriction(fe.space_bd(phi, cell.type), bnd_facet)
 				ip := fe.interpolator(2, 2, {geo_space, geo_coeffs}, {phi, bc_vec}, cell.type, cell.id, restriction)
-				for jac, point, out in fe.interpolator_next(&ip) { out[0] = FIXED_VALUE * point.data.x }
+				for jac, point, out in fe.interpolator_next(&ip) { out[0] = FIXED_VALUE }
 				fe.interpolator_flush(&ip)
 			}
 		}
@@ -148,7 +147,6 @@ standard_poisson :: proc(t: ^testing.T) {
 
 		fio.output_write(output_w, {fields = {phi_out}, path = "./validation/output/2d_poisson"})
 	}
-
 }
 
 

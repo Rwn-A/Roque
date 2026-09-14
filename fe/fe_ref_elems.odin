@@ -263,6 +263,16 @@ Rule :: struct {
 	weights:    []f64, // optional
 }
 
+basis_infer_quad :: proc(bd: Basis_Desc) -> Rule{
+	o := int(bd.order) * 2
+	switch {
+	case 0 <= 1: return element_quad_rule(bd.element, .Q1)
+	case 0 <= 3: return element_quad_rule(bd.element, .Q3)
+	case 0 <= 5: return element_quad_rule(bd.element, .Q5)
+	case: return element_quad_rule(bd.element, .Q5)
+	}
+}
+
 basis_quantity_components :: proc(et: Element_Type, qty: Basis_Quantity) -> int {
 	switch qty {
 	case .Scalar, .Vector_Divergence: return 1
@@ -301,7 +311,15 @@ basis_sub_entity_perm :: proc(bd: Basis_Desc, sub_entity: Element_Type, orientat
 	return basis_info_core(bd).sub_entity_perms[sub_entity][orientation]
 }
 
-oriented_local_dof :: proc(bd: Basis_Desc, sub_et: Element_Type, orientation: u8, local: int) -> (canonical: int, flip: bool) {
+basis_orient_dof :: proc(
+	bd: Basis_Desc,
+	sub_et: Element_Type,
+	orientation: u8,
+	local: int,
+) -> (
+	canonical: int,
+	flip: bool,
+) {
 	perm := basis_sub_entity_perm(bd, sub_et, orientation)
 	return perm.perm[local], perm.sign[local] == -1
 }
@@ -335,6 +353,8 @@ basis_functional_rule :: proc(bd: Basis_Desc, dof: int) -> Rule {
 ROOT_3     :: 1.73205080757
 REC_ROOT_3 :: 1.0 / ROOT_3
 ROOT_3_5   :: 0.7745966692414834
+ROOT_2     :: 1.41421356237
+REC_ROOT_2 :: 1.0 / ROOT_2
 
 REF_POINT :: Reference_Element {
 	topo = {
@@ -344,6 +364,11 @@ REF_POINT :: Reference_Element {
 		sub_entity_verts = #partial{.D0 = {{0}}},
 		sub_entity_edges = {},
 		orientation_perms = {},
+	},
+	quad = [Quadrature_Set]Reference_Quadrature {
+		.Q1 = {points = {{0, 0, 0}}, weights = {1}},
+		.Q3 = {points = {{0, 0, 0}}, weights = {1}},
+		.Q5 = {points = {{0, 0, 0}}, weights = {1}},
 	},
 }
 
@@ -405,22 +430,14 @@ REF_LINE :: Reference_Element {
 	},
 }
 
-// Ref tri vertices: v0=(0,0), v1=(1,0), v2=(0,1). Barycentric L0=1-x-y, L1=x, L2=y.
 REF_TRI :: Reference_Element {
 	topo = {
 		dim = .D2,
 		facet_types = {.Line, .Line, .Line},
-		facet_ref_normals = {{0, -1, 0}, {REC_ROOT_3, REC_ROOT_3, 0}, {-1, 0, 0}},
+		facet_ref_normals = {{0, -1, 0}, {REC_ROOT_2, REC_ROOT_2, 0}, {-1, 0, 0}},
 		sub_entity_verts = #partial{.D0 = {{0}, {1}, {2}}, .D1 = {{0, 1}, {1, 2}, {2, 0}}, .D2 = {{0, 1, 2}}},
 		sub_entity_edges = {},
-		orientation_perms = {
-			{0, 1, 2},
-			{0, 2, 1},
-			{1, 0, 2},
-			{1, 2, 0},
-			{2, 0, 1},
-			{2, 1, 0},
-		},
+		orientation_perms = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}},
 	},
 	quad = [Quadrature_Set]Reference_Quadrature {
 		.Q1 = {points = {{1.0 / 3.0, 1.0 / 3.0, 0}}, weights = {0.5}},
@@ -473,7 +490,7 @@ REF_TRI :: Reference_Element {
 			support = {{.D0, 0, 0}, {.D0, 1, 0}, {.D0, 2, 0}, {.D1, 0, 0}, {.D1, 1, 0}, {.D1, 2, 0}},
 			nodes = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0.5, 0, 0}, {0.5, 0.5, 0}, {0, 0.5, 0}},
 			facet_restrictions = {{0, 1, 3}, {1, 2, 4}, {2, 0, 5}},
-			sub_entity_perms = #partial {.Line = {{perm = {0}, sign = {1}}, {perm = {0}, sign = {1}}}},
+			sub_entity_perms = #partial{.Line = {{perm = {0}, sign = {1}}, {perm = {0}, sign = {1}}}},
 			vals = proc(dof: int, r: Ref_Vec) -> f64 {
 				x, y := r.x, r.y
 				l0 := 1.0 - x - y
@@ -490,7 +507,8 @@ REF_TRI :: Reference_Element {
 			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
 				x, y := r.x, r.y
 				switch dof {
-				case 0: v := 4.0 * x + 4.0 * y - 3.0; return {v, v, 0}
+				case 0:
+					v := 4.0 * x + 4.0 * y - 3.0; return {v, v, 0}
 				case 1: return {4.0 * x - 1.0, 0, 0}
 				case 2: return {0, 4.0 * y - 1.0, 0}
 				case 3: return {4.0 - 8.0 * x - 4.0 * y, -4.0 * x, 0}
@@ -501,9 +519,30 @@ REF_TRI :: Reference_Element {
 			},
 		},
 	},
+	rt = #partial{
+		.O1 = {
+			support = {{.D1, 0, 0}, {.D1, 1, 0}, {.D1, 2, 0}},
+			facet_restrictions = {{0}, {1}, {2}},
+			sub_entity_perms = #partial{.Line = {{perm = {0}, sign = {1}}, {perm = {0}, sign = {-1}}}},
+			vals = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
+				x, y := r.x, r.y
+				switch dof {
+				case 0: return {x, y - 1.0, 0}
+				case 1: return {x, y, 0}
+				case 2: return {x - 1.0, y, 0}
+				case: unreachable()
+				}
+			},
+			divs = proc(dof: int, r: Ref_Vec) -> f64 {
+				switch dof {
+				case 0, 1, 2: return 2.0
+				case: unreachable()
+				}
+			},
+		},
+	},
 }
 
-// Ref quad domain [-1,1]^2, vertices v0=(-1,-1), v1=(1,-1), v2=(1,1), v3=(-1,1).
 REF_QUAD :: Reference_Element {
 	topo = {
 		dim = .D2,
@@ -526,12 +565,47 @@ REF_QUAD :: Reference_Element {
 			{1, 0, 3, 2},
 		},
 	},
+	quad = [Quadrature_Set]Reference_Quadrature {
+		.Q1 = {points = {{0, 0, 0}}, weights = {4}},
+		.Q3 = {
+			points = {
+				{-REC_ROOT_3, -REC_ROOT_3, 0},
+				{REC_ROOT_3, -REC_ROOT_3, 0},
+				{REC_ROOT_3, REC_ROOT_3, 0},
+				{-REC_ROOT_3, REC_ROOT_3, 0},
+			},
+			weights = {1, 1, 1, 1},
+		},
+		.Q5 = {
+			points = {
+				{-ROOT_3_5, -ROOT_3_5, 0},
+				{0., -ROOT_3_5, 0},
+				{ROOT_3_5, -ROOT_3_5, 0},
+				{-ROOT_3_5, 0., 0},
+				{0., 0., 0},
+				{ROOT_3_5, 0., 0},
+				{-ROOT_3_5, ROOT_3_5, 0},
+				{0., ROOT_3_5, 0},
+				{ROOT_3_5, ROOT_3_5, 0},
+			},
+			weights = {
+				25. / 81.,
+				40. / 81.,
+				25. / 81.,
+				40. / 81.,
+				64. / 81.,
+				40. / 81.,
+				25. / 81.,
+				40. / 81.,
+				25. / 81.,
+			},
+		},
+	},
 	lagrange = {
 		.O1 = {
 			support = {{.D0, 0, 0}, {.D0, 1, 0}, {.D0, 2, 0}, {.D0, 3, 0}},
 			nodes = {{-1, -1, 0}, {1, -1, 0}, {1, 1, 0}, {-1, 1, 0}},
 			facet_restrictions = {{0, 1}, {1, 2}, {2, 3}, {3, 0}},
-			sub_entity_perms = #partial {.Line = {{perm = {0}, sign = {1}}, {perm = {0}, sign = {1}}}},
 			vals = proc(dof: int, r: Ref_Vec) -> f64 {
 				x, y := r.x, r.y
 				switch dof {
@@ -555,16 +629,29 @@ REF_QUAD :: Reference_Element {
 		},
 		.O2 = {
 			support = {
-				{.D0, 0, 0}, {.D0, 1, 0}, {.D0, 2, 0}, {.D0, 3, 0},
-				{.D1, 0, 0}, {.D1, 1, 0}, {.D1, 2, 0}, {.D1, 3, 0},
+				{.D0, 0, 0},
+				{.D0, 1, 0},
+				{.D0, 2, 0},
+				{.D0, 3, 0},
+				{.D1, 0, 0},
+				{.D1, 1, 0},
+				{.D1, 2, 0},
+				{.D1, 3, 0},
 				{.D2, 0, 0},
 			},
 			nodes = {
-				{-1, -1, 0}, {1, -1, 0}, {1, 1, 0}, {-1, 1, 0},
-				{0, -1, 0}, {1, 0, 0}, {0, 1, 0}, {-1, 0, 0},
+				{-1, -1, 0},
+				{1, -1, 0},
+				{1, 1, 0},
+				{-1, 1, 0},
+				{0, -1, 0},
+				{1, 0, 0},
+				{0, 1, 0},
+				{-1, 0, 0},
 				{0, 0, 0},
 			},
 			facet_restrictions = {{0, 1, 4}, {1, 2, 5}, {2, 3, 6}, {3, 0, 7}},
+			sub_entity_perms = #partial{.Line = {{perm = {0}, sign = {1}}, {perm = {0}, sign = {1}}}},
 			vals = proc(dof: int, r: Ref_Vec) -> f64 {
 				x, y := r.x, r.y
 				nm1 :: proc(t: f64) -> f64 { return (t * t - t) / 2.0 }
@@ -606,39 +693,90 @@ REF_QUAD :: Reference_Element {
 			},
 		},
 	},
+	rt = #partial{
+		.O1 = {
+			support = {{.D1, 0, 0}, {.D1, 1, 0}, {.D1, 2, 0}, {.D1, 3, 0}},
+			facet_restrictions = {{0}, {1}, {2}, {3}},
+			sub_entity_perms = #partial{.Line = {{perm = {0}, sign = {1}}, {perm = {0}, sign = {-1}}}},
+			vals = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
+				x, y := r.x, r.y
+				switch dof {
+				case 0: return {0, (y - 1.0) / 4.0, 0}
+				case 1: return {(x + 1.0) / 4.0, 0, 0}
+				case 2: return {0, (y + 1.0) / 4.0, 0}
+				case 3: return {(x - 1.0) / 4.0, 0, 0}
+				case: unreachable()
+				}
+			},
+			divs = proc(dof: int, r: Ref_Vec) -> f64 {
+				switch dof {
+				case 0, 1, 2, 3: return 0.25
+				case: unreachable()
+				}
+			},
+		},
+	},
 }
 
-// Ref tet vertices: v0=(0,0,0), v1=(1,0,0), v2=(0,1,0), v3=(0,0,1). Barycentric L0=1-x-y-z, L1=x, L2=y, L3=z.
 REF_TET :: Reference_Element {
 	topo = {
 		dim = .D3,
 		facet_types = {.Tri, .Tri, .Tri, .Tri},
 		facet_ref_normals = {{0, 0, -1}, {0, -1, 0}, {-1, 0, 0}, {REC_ROOT_3, REC_ROOT_3, REC_ROOT_3}},
-		sub_entity_verts = #partial {
+		sub_entity_verts = #partial{
 			.D0 = {{0}, {1}, {2}, {3}},
-			.D1 = {
-				{0, 1},
-				{1, 2},
-				{2, 0},
-				{0, 3},
-				{1, 3},
-				{2, 3},
-			},
-			.D2 = {
-				{0, 2, 1},
-				{0, 1, 3},
-				{0, 3, 2},
-				{1, 2, 3},
-			},
+			.D1 = {{0, 1}, {1, 2}, {2, 0}, {0, 3}, {1, 3}, {2, 3}},
+			.D2 = {{0, 2, 1}, {0, 1, 3}, {0, 3, 2}, {1, 2, 3}},
 			.D3 = {{0, 1, 2, 3}},
 		},
-		sub_entity_edges = {
-			{2, 1, 0},
-			{0, 4, 3},
-			{3, 5, 2},
-			{1, 5, 4},
-		},
+		sub_entity_edges = {{2, 1, 0}, {0, 4, 3}, {3, 5, 2}, {1, 5, 4}},
 		orientation_perms = {},
+	},
+	quad = [Quadrature_Set]Reference_Quadrature {
+		.Q1 = {points = {{0.25, 0.25, 0.25}}, weights = {1.0 / 6.0}},
+		.Q3 = {
+			points = {
+				{0.138196601125011, 0.138196601125011, 0.138196601125011},
+				{0.585410196624968, 0.138196601125011, 0.138196601125011},
+				{0.138196601125011, 0.585410196624968, 0.138196601125011},
+				{0.138196601125011, 0.138196601125011, 0.585410196624968},
+			},
+			weights = {1.0 / 24.0, 1.0 / 24.0, 1.0 / 24.0, 1.0 / 24.0},
+		},
+		.Q5 = {
+			points = {
+				{0.0927352503108912, 0.0927352503108912, 0.0927352503108912},
+				{0.7217942490673264, 0.0927352503108912, 0.0927352503108912},
+				{0.0927352503108912, 0.7217942490673264, 0.0927352503108912},
+				{0.0927352503108912, 0.0927352503108912, 0.7217942490673264},
+				{0.3108859192633006, 0.3108859192633006, 0.3108859192633006},
+				{0.0673422421100982, 0.3108859192633006, 0.3108859192633006},
+				{0.3108859192633006, 0.0673422421100982, 0.3108859192633006},
+				{0.3108859192633006, 0.3108859192633006, 0.0673422421100982},
+				{0.0455037041256495, 0.0455037041256495, 0.4544962958743505},
+				{0.0455037041256495, 0.4544962958743505, 0.0455037041256495},
+				{0.4544962958743505, 0.0455037041256495, 0.0455037041256495},
+				{0.4544962958743505, 0.4544962958743505, 0.0455037041256495},
+				{0.4544962958743505, 0.0455037041256495, 0.4544962958743505},
+				{0.0455037041256495, 0.4544962958743505, 0.4544962958743505},
+			},
+			weights = {
+				0.01224884051939365,
+				0.01224884051939365,
+				0.01224884051939365,
+				0.01224884051939365,
+				0.01878132095300263,
+				0.01878132095300263,
+				0.01878132095300263,
+				0.01878132095300263,
+				0.00709100346284690,
+				0.00709100346284690,
+				0.00709100346284690,
+				0.00709100346284690,
+				0.00709100346284690,
+				0.00709100346284690,
+			},
+		},
 	},
 	lagrange = {
 		.O1 = {
@@ -666,19 +804,31 @@ REF_TET :: Reference_Element {
 		},
 		.O2 = {
 			support = {
-				{.D0, 0, 0}, {.D0, 1, 0}, {.D0, 2, 0}, {.D0, 3, 0},
-				{.D1, 0, 0}, {.D1, 1, 0}, {.D1, 2, 0}, {.D1, 3, 0}, {.D1, 4, 0}, {.D1, 5, 0},
+				{.D0, 0, 0},
+				{.D0, 1, 0},
+				{.D0, 2, 0},
+				{.D0, 3, 0},
+				{.D1, 0, 0},
+				{.D1, 1, 0},
+				{.D1, 2, 0},
+				{.D1, 3, 0},
+				{.D1, 4, 0},
+				{.D1, 5, 0},
 			},
 			nodes = {
-				{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1},
-				{0.5, 0, 0}, {0.5, 0.5, 0}, {0, 0.5, 0}, {0, 0, 0.5}, {0.5, 0, 0.5}, {0, 0.5, 0.5},
+				{0, 0, 0},
+				{1, 0, 0},
+				{0, 1, 0},
+				{0, 0, 1},
+				{0.5, 0, 0},
+				{0.5, 0.5, 0},
+				{0, 0.5, 0},
+				{0, 0, 0.5},
+				{0.5, 0, 0.5},
+				{0, 0.5, 0.5},
 			},
-			facet_restrictions = {
-				{0, 2, 1, 6, 5, 4},
-				{0, 1, 3, 4, 8, 7},
-				{0, 3, 2, 7, 9, 6},
-				{1, 2, 3, 5, 9, 8},
-			},
+			facet_restrictions = {{0, 2, 1, 6, 5, 4}, {0, 1, 3, 4, 8, 7}, {0, 3, 2, 7, 9, 6}, {1, 2, 3, 5, 9, 8}},
+			sub_entity_perms = #partial{.Line = {{perm = {0}, sign = {1}}, {perm = {0}, sign = {1}}}},
 			vals = proc(dof: int, r: Ref_Vec) -> f64 {
 				x, y, z := r.x, r.y, r.z
 				l0 := 1.0 - x - y - z
@@ -699,7 +849,8 @@ REF_TET :: Reference_Element {
 			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
 				x, y, z := r.x, r.y, r.z
 				switch dof {
-				case 0: v := 4.0 * x + 4.0 * y + 4.0 * z - 3.0; return {v, v, v}
+				case 0:
+					v := 4.0 * x + 4.0 * y + 4.0 * z - 3.0; return {v, v, v}
 				case 1: return {4.0 * x - 1.0, 0, 0}
 				case 2: return {0, 4.0 * y - 1.0, 0}
 				case 3: return {0, 0, 4.0 * z - 1.0}
@@ -714,75 +865,153 @@ REF_TET :: Reference_Element {
 			},
 		},
 	},
+	rt = #partial{
+		.O1 = {
+			support = {{.D2, 0, 0}, {.D2, 1, 0}, {.D2, 2, 0}, {.D2, 3, 0}},
+			facet_restrictions = {{0}, {1}, {2}, {3}},
+			sub_entity_perms = #partial{
+				.Tri = {
+					{perm = {0}, sign = {1}},
+					{perm = {0}, sign = {-1}},
+					{perm = {0}, sign = {-1}},
+					{perm = {0}, sign = {1}},
+					{perm = {0}, sign = {1}},
+					{perm = {0}, sign = {-1}},
+				},
+			},
+			vals = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
+				x, y, z := r.x, r.y, r.z
+				switch dof {
+				case 0: return {2.0 * x, 2.0 * y, 2.0 * z - 2.0}
+				case 1: return {2.0 * x, 2.0 * y - 2.0, 2.0 * z}
+				case 2: return {2.0 * x - 2.0, 2.0 * y, 2.0 * z}
+				case 3: return {2.0 * x, 2.0 * y, 2.0 * z}
+				case: unreachable()
+				}
+			},
+			divs = proc(dof: int, r: Ref_Vec) -> f64 {
+				switch dof {
+				case 0, 1, 2, 3: return 6.0
+				case: unreachable()
+				}
+			},
+		},
+	},
 }
 
-// Ref hex domain [-1,1]^3, vertices v0..v3 on z=-1 (ccw), v4..v7 above v0..v3 on z=+1.
 REF_HEX :: Reference_Element {
 	topo = {
 		dim = .D3,
 		facet_types = {.Quad, .Quad, .Quad, .Quad, .Quad, .Quad},
-		facet_ref_normals = {
-			{0, 0, -1},
-			{0, 0, +1},
-			{0, -1, 0},
-			{0, +1, 0},
-			{-1, 0, 0},
-			{+1, 0, 0},
-		},
-		sub_entity_verts = #partial {
+		facet_ref_normals = {{0, 0, -1}, {0, 0, +1}, {0, -1, 0}, {0, +1, 0}, {-1, 0, 0}, {+1, 0, 0}},
+		sub_entity_verts = #partial{
 			.D0 = {{0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}},
-			.D1 = {
-				{0, 1},
-				{1, 2},
-				{2, 3},
-				{3, 0},
-				{4, 5},
-				{5, 6},
-				{6, 7},
-				{7, 4},
-				{0, 4},
-				{1, 5},
-				{2, 6},
-				{3, 7},
-			},
-			.D2 = {
-				{0, 3, 2, 1},
-				{4, 5, 6, 7},
-				{0, 1, 5, 4},
-				{3, 7, 6, 2},
-				{0, 4, 7, 3},
-				{1, 2, 6, 5},
-			},
+			.D1 = {{0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}, {5, 6}, {6, 7}, {7, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}},
+			.D2 = {{0, 3, 2, 1}, {4, 5, 6, 7}, {0, 1, 5, 4}, {3, 7, 6, 2}, {0, 4, 7, 3}, {1, 2, 6, 5}},
 			.D3 = {{0, 1, 2, 3, 4, 5, 6, 7}},
 		},
-		sub_entity_edges = {
-			{2, 1, 0, 3},
-			{4, 5, 6, 7},
-			{0, 9, 4, 8},
-			{3, 7, 6, 11},
-			{8, 7, 11, 3},
-			{1, 10, 5, 9},
-		},
+		sub_entity_edges = {{2, 1, 0, 3}, {4, 5, 6, 7}, {0, 9, 4, 8}, {11, 6, 10, 2}, {8, 7, 11, 3}, {1, 10, 5, 9}},
 		orientation_perms = {},
+	},
+	quad = [Quadrature_Set]Reference_Quadrature {
+		.Q1 = {points = {{0, 0, 0}}, weights = {8}},
+		.Q3 = {
+			points = {
+				{-REC_ROOT_3, -REC_ROOT_3, -REC_ROOT_3},
+				{REC_ROOT_3, -REC_ROOT_3, -REC_ROOT_3},
+				{REC_ROOT_3, REC_ROOT_3, -REC_ROOT_3},
+				{-REC_ROOT_3, REC_ROOT_3, -REC_ROOT_3},
+				{-REC_ROOT_3, -REC_ROOT_3, REC_ROOT_3},
+				{REC_ROOT_3, -REC_ROOT_3, REC_ROOT_3},
+				{REC_ROOT_3, REC_ROOT_3, REC_ROOT_3},
+				{-REC_ROOT_3, REC_ROOT_3, REC_ROOT_3},
+			},
+			weights = {1, 1, 1, 1, 1, 1, 1, 1},
+		},
+		.Q5 = {
+			points = {
+				{-ROOT_3_5, -ROOT_3_5, -ROOT_3_5},
+				{0., -ROOT_3_5, -ROOT_3_5},
+				{ROOT_3_5, -ROOT_3_5, -ROOT_3_5},
+				{-ROOT_3_5, 0., -ROOT_3_5},
+				{0., 0., -ROOT_3_5},
+				{ROOT_3_5, 0., -ROOT_3_5},
+				{-ROOT_3_5, ROOT_3_5, -ROOT_3_5},
+				{0., ROOT_3_5, -ROOT_3_5},
+				{ROOT_3_5, ROOT_3_5, -ROOT_3_5},
+				{-ROOT_3_5, -ROOT_3_5, 0.},
+				{0., -ROOT_3_5, 0.},
+				{ROOT_3_5, -ROOT_3_5, 0.},
+				{-ROOT_3_5, 0., 0.},
+				{0., 0., 0.},
+				{ROOT_3_5, 0., 0.},
+				{-ROOT_3_5, ROOT_3_5, 0.},
+				{0., ROOT_3_5, 0.},
+				{ROOT_3_5, ROOT_3_5, 0.},
+				{-ROOT_3_5, -ROOT_3_5, ROOT_3_5},
+				{0., -ROOT_3_5, ROOT_3_5},
+				{ROOT_3_5, -ROOT_3_5, ROOT_3_5},
+				{-ROOT_3_5, 0., ROOT_3_5},
+				{0., 0., ROOT_3_5},
+				{ROOT_3_5, 0., ROOT_3_5},
+				{-ROOT_3_5, ROOT_3_5, ROOT_3_5},
+				{0., ROOT_3_5, ROOT_3_5},
+				{ROOT_3_5, ROOT_3_5, ROOT_3_5},
+			},
+			weights = {
+				0.17146776,
+				0.27469136,
+				0.17146776,
+				0.27469136,
+				0.43209877,
+				0.27469136,
+				0.17146776,
+				0.27469136,
+				0.17146776,
+				0.27469136,
+				0.43209877,
+				0.27469136,
+				0.43209877,
+				0.68659221,
+				0.43209877,
+				0.27469136,
+				0.43209877,
+				0.27469136,
+				0.17146776,
+				0.27469136,
+				0.17146776,
+				0.27469136,
+				0.43209877,
+				0.27469136,
+				0.17146776,
+				0.27469136,
+				0.17146776,
+			},
+		},
 	},
 	lagrange = {
 		.O1 = {
 			support = {
-				{.D0, 0, 0}, {.D0, 1, 0}, {.D0, 2, 0}, {.D0, 3, 0},
-				{.D0, 4, 0}, {.D0, 5, 0}, {.D0, 6, 0}, {.D0, 7, 0},
+				{.D0, 0, 0},
+				{.D0, 1, 0},
+				{.D0, 2, 0},
+				{.D0, 3, 0},
+				{.D0, 4, 0},
+				{.D0, 5, 0},
+				{.D0, 6, 0},
+				{.D0, 7, 0},
 			},
 			nodes = {
-				{-1, -1, -1}, {1, -1, -1}, {1, 1, -1}, {-1, 1, -1},
-				{-1, -1, 1}, {1, -1, 1}, {1, 1, 1}, {-1, 1, 1},
+				{-1, -1, -1},
+				{1, -1, -1},
+				{1, 1, -1},
+				{-1, 1, -1},
+				{-1, -1, 1},
+				{1, -1, 1},
+				{1, 1, 1},
+				{-1, 1, 1},
 			},
-			facet_restrictions = {
-				{0, 3, 2, 1},
-				{4, 5, 6, 7},
-				{0, 1, 5, 4},
-				{3, 7, 6, 2},
-				{0, 4, 7, 3},
-				{1, 2, 6, 5},
-			},
+			facet_restrictions = {{0, 3, 2, 1}, {4, 5, 6, 7}, {0, 1, 5, 4}, {3, 7, 6, 2}, {0, 4, 7, 3}, {1, 2, 6, 5}},
 			vals = proc(dof: int, r: Ref_Vec) -> f64 {
 				x, y, z := r.x, r.y, r.z
 				switch dof {
@@ -800,11 +1029,15 @@ REF_HEX :: Reference_Element {
 			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
 				x, y, z := r.x, r.y, r.z
 				switch dof {
-				case 0: return {-(1.0 - y) * (1.0 - z) / 8.0, -(1.0 - x) * (1.0 - z) / 8.0, -(1.0 - x) * (1.0 - y) / 8.0}
-				case 1: return {(1.0 - y) * (1.0 - z) / 8.0, -(1.0 + x) * (1.0 - z) / 8.0, -(1.0 + x) * (1.0 - y) / 8.0}
+				case 0:
+					return {-(1.0 - y) * (1.0 - z) / 8.0, -(1.0 - x) * (1.0 - z) / 8.0, -(1.0 - x) * (1.0 - y) / 8.0}
+				case 1:
+					return {(1.0 - y) * (1.0 - z) / 8.0, -(1.0 + x) * (1.0 - z) / 8.0, -(1.0 + x) * (1.0 - y) / 8.0}
 				case 2: return {(1.0 + y) * (1.0 - z) / 8.0, (1.0 + x) * (1.0 - z) / 8.0, -(1.0 + x) * (1.0 + y) / 8.0}
-				case 3: return {-(1.0 + y) * (1.0 - z) / 8.0, (1.0 - x) * (1.0 - z) / 8.0, -(1.0 - x) * (1.0 + y) / 8.0}
-				case 4: return {-(1.0 - y) * (1.0 + z) / 8.0, -(1.0 - x) * (1.0 + z) / 8.0, (1.0 - x) * (1.0 - y) / 8.0}
+				case 3:
+					return {-(1.0 + y) * (1.0 - z) / 8.0, (1.0 - x) * (1.0 - z) / 8.0, -(1.0 - x) * (1.0 + y) / 8.0}
+				case 4:
+					return {-(1.0 - y) * (1.0 + z) / 8.0, -(1.0 - x) * (1.0 + z) / 8.0, (1.0 - x) * (1.0 - y) / 8.0}
 				case 5: return {(1.0 - y) * (1.0 + z) / 8.0, -(1.0 + x) * (1.0 + z) / 8.0, (1.0 + x) * (1.0 - y) / 8.0}
 				case 6: return {(1.0 + y) * (1.0 + z) / 8.0, (1.0 + x) * (1.0 + z) / 8.0, (1.0 + x) * (1.0 + y) / 8.0}
 				case 7: return {-(1.0 + y) * (1.0 + z) / 8.0, (1.0 - x) * (1.0 + z) / 8.0, (1.0 - x) * (1.0 + y) / 8.0}
@@ -814,28 +1047,83 @@ REF_HEX :: Reference_Element {
 		},
 		.O2 = {
 			support = {
-				{.D0, 0, 0}, {.D0, 1, 0}, {.D0, 2, 0}, {.D0, 3, 0}, {.D0, 4, 0}, {.D0, 5, 0}, {.D0, 6, 0}, {.D0, 7, 0},
-				{.D1, 0, 0}, {.D1, 1, 0}, {.D1, 2, 0}, {.D1, 3, 0}, {.D1, 4, 0}, {.D1, 5, 0},
-				{.D1, 6, 0}, {.D1, 7, 0}, {.D1, 8, 0}, {.D1, 9, 0}, {.D1, 10, 0}, {.D1, 11, 0},
-				{.D2, 0, 0}, {.D2, 1, 0}, {.D2, 2, 0}, {.D2, 3, 0}, {.D2, 4, 0}, {.D2, 5, 0},
+				{.D0, 0, 0},
+				{.D0, 1, 0},
+				{.D0, 2, 0},
+				{.D0, 3, 0},
+				{.D0, 4, 0},
+				{.D0, 5, 0},
+				{.D0, 6, 0},
+				{.D0, 7, 0},
+				{.D1, 0, 0},
+				{.D1, 1, 0},
+				{.D1, 2, 0},
+				{.D1, 3, 0},
+				{.D1, 4, 0},
+				{.D1, 5, 0},
+				{.D1, 6, 0},
+				{.D1, 7, 0},
+				{.D1, 8, 0},
+				{.D1, 9, 0},
+				{.D1, 10, 0},
+				{.D1, 11, 0},
+				{.D2, 0, 0},
+				{.D2, 1, 0},
+				{.D2, 2, 0},
+				{.D2, 3, 0},
+				{.D2, 4, 0},
+				{.D2, 5, 0},
 				{.D3, 0, 0},
 			},
 			nodes = {
-				{-1, -1, -1}, {1, -1, -1}, {1, 1, -1}, {-1, 1, -1},
-				{-1, -1, 1}, {1, -1, 1}, {1, 1, 1}, {-1, 1, 1},
-				{0, -1, -1}, {1, 0, -1}, {0, 1, -1}, {-1, 0, -1},
-				{0, -1, 1}, {1, 0, 1}, {0, 1, 1}, {-1, 0, 1},
-				{-1, -1, 0}, {1, -1, 0}, {1, 1, 0}, {-1, 1, 0},
-				{0, 0, -1}, {0, 0, 1}, {0, -1, 0}, {0, 1, 0}, {-1, 0, 0}, {1, 0, 0},
+				{-1, -1, -1},
+				{1, -1, -1},
+				{1, 1, -1},
+				{-1, 1, -1},
+				{-1, -1, 1},
+				{1, -1, 1},
+				{1, 1, 1},
+				{-1, 1, 1},
+				{0, -1, -1},
+				{1, 0, -1},
+				{0, 1, -1},
+				{-1, 0, -1},
+				{0, -1, 1},
+				{1, 0, 1},
+				{0, 1, 1},
+				{-1, 0, 1},
+				{-1, -1, 0},
+				{1, -1, 0},
+				{1, 1, 0},
+				{-1, 1, 0},
+				{0, 0, -1},
+				{0, 0, 1},
+				{0, -1, 0},
+				{0, 1, 0},
+				{-1, 0, 0},
+				{1, 0, 0},
 				{0, 0, 0},
 			},
 			facet_restrictions = {
 				{0, 3, 2, 1, 10, 9, 8, 11, 20},
 				{4, 5, 6, 7, 12, 13, 14, 15, 21},
 				{0, 1, 5, 4, 8, 17, 12, 16, 22},
-				{3, 7, 6, 2, 11, 15, 14, 19, 23},
+				{3, 7, 6, 2, 10, 18, 14, 19, 23},
 				{0, 4, 7, 3, 16, 15, 19, 11, 24},
 				{1, 2, 6, 5, 9, 18, 13, 17, 25},
+			},
+			sub_entity_perms = #partial{
+				.Line = {{perm = {0}, sign = {1}}, {perm = {0}, sign = {1}}},
+				.Quad = {
+					{perm = {0}, sign = {1}},
+					{perm = {0}, sign = {1}},
+					{perm = {0}, sign = {1}},
+					{perm = {0}, sign = {1}},
+					{perm = {0}, sign = {1}},
+					{perm = {0}, sign = {1}},
+					{perm = {0}, sign = {1}},
+					{perm = {0}, sign = {1}},
+				},
 			},
 			vals = proc(dof: int, r: Ref_Vec) -> f64 {
 				x, y, z := r.x, r.y, r.z
@@ -909,6 +1197,42 @@ REF_HEX :: Reference_Element {
 				case 24: return {dnm1(x) * n0(y) * n0(z), nm1(x) * dn0(y) * n0(z), nm1(x) * n0(y) * dn0(z)}
 				case 25: return {dnp1(x) * n0(y) * n0(z), np1(x) * dn0(y) * n0(z), np1(x) * n0(y) * dn0(z)}
 				case 26: return {dn0(x) * n0(y) * n0(z), n0(x) * dn0(y) * n0(z), n0(x) * n0(y) * dn0(z)}
+				case: unreachable()
+				}
+			},
+		},
+	},
+	rt = #partial{
+		.O1 = {
+			support = {{.D2, 0, 0}, {.D2, 1, 0}, {.D2, 2, 0}, {.D2, 3, 0}, {.D2, 4, 0}, {.D2, 5, 0}},
+			facet_restrictions = {{0}, {1}, {2}, {3}, {4}, {5}},
+			sub_entity_perms = #partial{
+				.Quad = {
+					{perm = {0}, sign = {1}},
+					{perm = {0}, sign = {1}},
+					{perm = {0}, sign = {1}},
+					{perm = {0}, sign = {1}},
+					{perm = {0}, sign = {-1}},
+					{perm = {0}, sign = {-1}},
+					{perm = {0}, sign = {-1}},
+					{perm = {0}, sign = {-1}},
+				},
+			},
+			vals = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
+				x, y, z := r.x, r.y, r.z
+				switch dof {
+				case 0: return {0, 0, (z - 1.0) / 8.0}
+				case 1: return {0, 0, (z + 1.0) / 8.0}
+				case 2: return {0, (y - 1.0) / 8.0, 0}
+				case 3: return {0, (y + 1.0) / 8.0, 0}
+				case 4: return {(x - 1.0) / 8.0, 0, 0}
+				case 5: return {(x + 1.0) / 8.0, 0, 0}
+				case: unreachable()
+				}
+			},
+			divs = proc(dof: int, r: Ref_Vec) -> f64 {
+				switch dof {
+				case 0, 1, 2, 3, 4, 5: return 0.125
 				case: unreachable()
 				}
 			},

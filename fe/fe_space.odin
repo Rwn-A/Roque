@@ -186,7 +186,7 @@ space_new :: proc(
 				l2g[dof] = assign_shared_dof(&shared[.D0], key, next_global)
 				signs[dof] = false
 			case .D1:
-				dof_local, flip := oriented_local_dof(
+				dof_local, flip := basis_orient_dof(
 					bd,
 					.Line,
 					conn.edge_orientations[sup.entity_index],
@@ -197,7 +197,7 @@ space_new :: proc(
 				signs[dof] = flip
 			case .D2:
 				ft := element_facet_type(bd.element, sup.entity_index)
-				dof_local, flip := oriented_local_dof(
+				dof_local, flip := basis_orient_dof(
 					bd,
 					ft,
 					conn.face_orientations[sup.entity_index],
@@ -302,7 +302,7 @@ space_facet_dofs :: proc(mesh: Mesh, space: ^Space, facet_id: Entity_ID, alloc :
 	restriction := basis_facet_restriction(space_bd(space, cell.type), local_facet)
 	l2g := space_l2g(space, cell.id)
 	out := make([]i32, len(restriction), alloc)
-	for i, ldof in restriction { out[i] = l2g[ldof] }
+	for ldof, i in restriction { out[i] = l2g[ldof] }
 
 	return out
 }
@@ -703,12 +703,12 @@ ms_create :: proc(mesh: Mesh, spaces: ..Constituent_Space) -> (ms: Multi_Space) 
 
 				switch sup.entity_dim {
 				case element_dim(et):
-					canonical, flip := oriented_local_dof(bd_cell, et, pair.orientation, sup.entity_dof_index)
+					canonical, flip := basis_orient_dof(bd_cell, et, pair.orientation, sup.entity_dof_index)
 					sldof = slave_flat[{sup.entity_dim, sup.entity_index, canonical}]
 					sign = -1.0 if flip else 1.0
 				case .D0: sldof = slave_flat[{.D0, pair.vertex_map[sup.entity_index], sup.entity_dof_index}]
 				case .D1:
-					canonical, flip := oriented_local_dof(
+					canonical, flip := basis_orient_dof(
 						bd_cell,
 						.Line,
 						pair.edge_orientation[sup.entity_index],
