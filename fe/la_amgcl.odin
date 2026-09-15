@@ -27,8 +27,9 @@ when ODIN_OS == .Linux {
 Precond :: struct {}
 
 Precond_Kind :: enum c.int {
-	SA   = 0,
-	ILU0 = 1,
+	SA    = 0,
+	ILU0  = 1,
+	SCHUR = 2,
 }
 
 Solver_Kind :: enum c.int {
@@ -37,9 +38,16 @@ Solver_Kind :: enum c.int {
 	FGMRES   = 2,
 }
 
+Relax_Kind :: enum c.int {
+	GAUSS_SEIDEL = 0,
+	ILU0         = 1,
+	SPAI0        = 2,
+}
+
 SA_Extra :: struct {
 	block_size:           c.int,
 	coarse_enough:        c.int,
+	relax:                Relax_Kind,
 	near_null_space:      [^]c.double,
 	near_null_space_cols: c.int,
 }
@@ -48,9 +56,19 @@ ILU0_Extra :: struct {
 	_reserved: c.int,
 }
 
+// Schur complement pressure-correction preconditioner
+Schur_Extra :: struct {
+	pmask:         [^]c.char,
+	variant:       c.int,
+	approx_schur:  c.bool,
+	usolver_relax: Relax_Kind,
+	adjust_p: bool,
+}
+
 Precond_Extra :: struct #raw_union {
-	sa:   SA_Extra,
-	ilu0: ILU0_Extra,
+	sa:    SA_Extra,
+	ilu0:  ILU0_Extra,
+	schur: Schur_Extra,
 }
 
 Precond_Params :: struct {
@@ -101,12 +119,25 @@ foreign amgcl_lib {
 
 SA_DEFAULT := Precond_Params {
 	kind = .SA,
-	extra = {sa = {block_size = 1, coarse_enough = 50, near_null_space = nil, near_null_space_cols = 0}},
+	extra = {
+		sa = {
+			block_size = 1,
+			coarse_enough = 50,
+			relax = .GAUSS_SEIDEL,
+			near_null_space = nil,
+			near_null_space_cols = 0,
+		},
+	},
 }
 
 ILU0_DEFAULT := Precond_Params {
 	kind = .ILU0,
 	extra = {ilu0 = {}},
+}
+
+SCHUR_DEFAULT := Precond_Params {
+	kind = .SCHUR,
+	extra = {schur = {pmask = nil, variant = 1, approx_schur = false, usolver_relax = .ILU0, adjust_p = true}},
 }
 
 CG_DEFAULT := Solver_Params {
@@ -144,16 +175,37 @@ Solve_Result :: struct {
 sa_params :: proc(
 	block_size := 1,
 	coarse_enough := 50,
+	relax := Relax_Kind.GAUSS_SEIDEL,
 	near_null_space: []f64 = nil,
 	near_null_space_cols := 0,
 ) -> Precond_Params {
 	p := SA_DEFAULT
 	p.extra.sa.block_size = clamp(c.int(block_size), 1, 4)
 	p.extra.sa.coarse_enough = c.int(coarse_enough)
+	p.extra.sa.relax = relax
 	if len(near_null_space) > 0 {
 		p.extra.sa.near_null_space = cast([^]c.double)raw_data(near_null_space)
 		p.extra.sa.near_null_space_cols = c.int(near_null_space_cols)
 	}
+	return p
+}
+
+// pmask: length n, matching the dof ordering of the matrix passed to
+// amgcl_precond_create. 1 marks a "pressure" (zero-block) dof, 0 marks a
+// "flow" dof.
+schur_params :: proc(
+	pmask: []u8,
+	variant := 1,
+	approx_schur := false,
+	usolver_relax := Relax_Kind.ILU0,
+	adjust_p := true,
+) -> Precond_Params {
+	p := SCHUR_DEFAULT
+	assert(len(pmask) > 0, "schur_params requires a non-empty pmask")
+	p.extra.schur.pmask = cast([^]c.char)raw_data(pmask)
+	p.extra.schur.variant = c.int(variant)
+	p.extra.schur.approx_schur = c.bool(approx_schur)
+	p.extra.schur.usolver_relax = usolver_relax
 	return p
 }
 
@@ -191,6 +243,9 @@ amgcl_precond_create :: proc(
 	p := params
 	if p.kind == .SA && p.extra.sa.near_null_space != nil {
 		assert(p.extra.sa.near_null_space_cols > 0, "near_null_space was set but near_null_space_cols is 0.")
+	}
+	if p.kind == .SCHUR {
+		assert(p.extra.schur.pmask != nil, "schur precond requires pmask to be set (use schur_params)")
 	}
 	precond = _precond_create(
 		c.int(n),

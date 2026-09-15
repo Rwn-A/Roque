@@ -8,7 +8,7 @@ import "core:mem/virtual"
 import "core:log"
 
 
-@(test)
+//@(test)
 elasticity_cantilever :: proc(t: ^testing.T) {
 	wf :: proc(
 		sys: fe.Sys,

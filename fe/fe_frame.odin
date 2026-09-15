@@ -41,5 +41,19 @@ frame_push_bvec :: proc(bvec: Bvec($BT), frame: Frame($R, $C, $T), alloc := cont
 	return out
 }
 
+// bvcec /= measurem, inplace transform
+frame_scale_bvec_by_measure :: proc(bvec: Bvec($BT), frame: Frame($R, $C, $T)) {
+	for point in 0 ..< bvec.points {
+		bp := bvec_at_point(bvec, point)
+		t := frame_at(frame, point)
+		m := 1 / small_mat_measure(t^)
+		for dof in 0 ..< bvec.dofs {
+			bv := bvec_dof_vec(bp, dof, C)
+			bv^ = small_vec_scale(bv^, m)
+		}
+	}
+}
+
+
 
 // TODO: might need cvec, cmat, pvec, pmat pushing as well.

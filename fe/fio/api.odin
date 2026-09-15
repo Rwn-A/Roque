@@ -128,12 +128,12 @@ SUBCELLS := [fe.Element_Type][fe.Order]Reference_Subcell {
 	.Hex    = HEX_SUBCELL,
 }
 
-LINE_SUBCELL :: [fe.Order]Reference_Subcell {
+LINE_SUBCELL :: #partial [fe.Order]Reference_Subcell {
 	.O1 = {points = {{-1, 0, 0}, {1, 0, 0}}, connectivity = {{0, 1}}},
 	.O2 = {points = {{-1, 0, 0}, {1, 0, 0}, {0, 0, 0}}, connectivity = {{0, 2}, {2, 1}}},
 }
 
-QUAD_SUBCELL :: [fe.Order]Reference_Subcell {
+QUAD_SUBCELL :: #partial [fe.Order]Reference_Subcell {
 	.O1 = {points = {{-1, -1, 0}, {1, -1, 0}, {1, 1, 0}, {-1, 1, 0}}, connectivity = {{0, 1, 2, 3}}},
 	.O2 = {
 		points = {
@@ -151,7 +151,7 @@ QUAD_SUBCELL :: [fe.Order]Reference_Subcell {
 	},
 }
 
-TRI_SUBCELL :: [fe.Order]Reference_Subcell {
+TRI_SUBCELL :: #partial [fe.Order]Reference_Subcell {
 	.O1 = {points = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}}, connectivity = {{0, 1, 2}}},
 	.O2 = {
 		points = {
@@ -171,7 +171,7 @@ TRI_SUBCELL :: [fe.Order]Reference_Subcell {
 	},
 }
 
-TET_SUBCELL :: [fe.Order]Reference_Subcell {
+TET_SUBCELL :: #partial [fe.Order]Reference_Subcell {
 	.O1 = {points = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}}, connectivity = {{0, 1, 2, 3}}},
 	.O2 = {
 		points = {
@@ -199,7 +199,7 @@ TET_SUBCELL :: [fe.Order]Reference_Subcell {
 	},
 }
 
-HEX_SUBCELL :: [fe.Order]Reference_Subcell {
+HEX_SUBCELL :: #partial [fe.Order]Reference_Subcell {
 	.O1 = {
 		points = {{-1, -1, -1}, {1, -1, -1}, {1, 1, -1}, {-1, 1, -1}, {-1, -1, 1}, {1, -1, 1}, {1, 1, 1}, {-1, 1, 1}},
 		connectivity = {{0, 1, 2, 3, 4, 5, 6, 7}},

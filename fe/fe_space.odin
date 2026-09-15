@@ -241,6 +241,7 @@ space_new_isoparemetric :: proc(mesh: Mesh, fields: int, alloc := context.alloca
 		id = next_id,
 		allocator = alloc,
 		owns_numbering = false,
+		sd = {.Lagrange, mesh.order, .Continuous, ALL_REGIONS}
 	}
 
 	next_id += 1
@@ -861,12 +862,26 @@ ms_near_null_space :: proc(ms: Multi_Space, vectors: ..State, alloc := context.a
 	return
 }
 
+// Build the schur mask for amgcl shcur compliment preconditioner.
+ms_schur_mask :: proc(ms: Multi_Space, pressure_space: Space_ID, alloc := context.allocator) -> []u8 {
+	mask := make([]u8, ms.total_soln_size, alloc)
+
+	r := ms_space_range(ms, pressure_space)
+	for gidx in r.base ..< r.end {
+		entry := ms.dof_map[gidx]
+		if entry.role == .Free {
+			mask[entry.soln_index] = 1
+		}
+	}
+
+	return mask
+}
+
 // Frees the multi space's arena.
 ms_destroy :: proc(ms: ^Multi_Space) {
 	virtual.arena_destroy(&ms.arena)
 }
 
-@(private)
 ms_space_range :: proc(ms: Multi_Space, id: Space_ID) -> Space_Range {
 	for r in ms.ranges { if r.id == id { return r } }
 	panic("space not in multi space")

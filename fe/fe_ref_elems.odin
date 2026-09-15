@@ -33,6 +33,7 @@ Dimension :: enum {
 // Order refers to increasing accuracy of approximation space, depending on what is applied to,
 // may not actually be equivalent to polynomial degree.
 Order :: enum {
+	O0,
 	O1,
 	O2,
 }
@@ -174,7 +175,7 @@ element_facet_verts :: proc(et: Element_Type, facet: int) -> []int {
 element_facet_ref_normal :: proc($T: typeid, $I: int, et: Element_Type, facet: int) -> Small_Vec(I, T) {
 	assert(et != .Point)
 	assert(I == int(element_dim(et)))
-	small_vec_from_slice(T, REFERENCE_ELEMENTS[et].topo.facet_ref_normals[facet], I)
+	return small_vec_from_slice(T, REFERENCE_ELEMENTS[et].topo.facet_ref_normals[facet][:], I)
 }
 
 // Find orientation key from a given vertex order, based on the target order.
@@ -267,7 +268,7 @@ Rule :: struct {
 
 // Rough heuristic of 2 * basis order as polynomial degree to be integrated.
 basis_infer_quad :: proc(bd: Basis_Desc) -> Rule {
-	o := (int(bd.order) + 1) * 2
+	o := (int(bd.order)) * 2
 	switch {
 	case o <= 1: return element_quad_rule(bd.element, .Q1)
 	case o <= 3: return element_quad_rule(bd.element, .Q3)
@@ -336,8 +337,9 @@ basis_functional_rule :: proc(bd: Basis_Desc, dof: int) -> Rule {
 
 		ft := element_facet_type(bd.element, sup.entity_index)
 		switch bd.order {
-		case .O1: return element_quad_rule(ft, .Q1)
-		case .O2: return element_quad_rule(ft, .Q3)
+		case .O0: return element_quad_rule(ft, .Q1)
+		case .O1: return element_quad_rule(ft, .Q3)
+		case .O2: return element_quad_rule(ft, .Q5)
 		case: unreachable()
 		}
 	case: unreachable()
@@ -367,6 +369,59 @@ REF_POINT :: Reference_Element {
 		.Q3 = {points = {{0, 0, 0}}, weights = {1}},
 		.Q5 = {points = {{0, 0, 0}}, weights = {1}},
 	},
+	lagrange = {
+		.O0 = {
+			support = {{.D0, 0, 0}},
+			nodes = {{0, 0, 0}},
+			facet_restrictions = {},
+			vals = proc(dof: int, r: Ref_Vec) -> f64 {
+				switch dof {
+				case 0: return 1.0
+				case: unreachable()
+				}
+			},
+			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
+				switch dof {
+				case 0: return {0, 0, 0}
+				case: unreachable()
+				}
+			},
+		},
+		.O1 = {
+			support = {{.D0, 0, 0}},
+			nodes = {{0, 0, 0}},
+			facet_restrictions = {},
+			vals = proc(dof: int, r: Ref_Vec) -> f64 {
+				switch dof {
+				case 0: return 1.0
+				case: unreachable()
+				}
+			},
+			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
+				switch dof {
+				case 0: return {0, 0, 0}
+				case: unreachable()
+				}
+			},
+		},
+		.O2 = {
+			support = {{.D0, 0, 0}},
+			nodes = {{0, 0, 0}},
+			facet_restrictions = {},
+			vals = proc(dof: int, r: Ref_Vec) -> f64 {
+				switch dof {
+				case 0: return 1.0
+				case: unreachable()
+				}
+			},
+			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
+				switch dof {
+				case 0: return {0, 0, 0}
+				case: unreachable()
+				}
+			},
+		},
+	},
 }
 
 REF_LINE :: Reference_Element {
@@ -384,6 +439,23 @@ REF_LINE :: Reference_Element {
 		.Q5 = {points = {{-ROOT_3_5, 0, 0}, {0, 0, 0}, {ROOT_3_5, 0, 0}}, weights = {5.0 / 9, 8.0 / 9, 5.0 / 9}},
 	},
 	lagrange = {
+		.O0 = {
+			support = {{.D1, 0, 0}},
+			nodes = {{0, 0, 0}},
+			facet_restrictions = {{}, {}},
+			vals = proc(dof: int, r: Ref_Vec) -> f64 {
+				switch dof {
+				case 0: return 1.0
+				case: unreachable()
+				}
+			},
+			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
+				switch dof {
+				case 0: return {0, 0, 0}
+				case: unreachable()
+				}
+			},
+		},
 		.O1 = {
 			support = {{.D0, 0, 0}, {.D0, 1, 0}},
 			nodes = {{-1, 0, 0}, {1, 0, 0}},
@@ -431,7 +503,11 @@ REF_TRI :: Reference_Element {
 	topo = {
 		dim = .D2,
 		facet_types = {.Line, .Line, .Line},
-		facet_ref_normals = {{0, -1, 0}, {REC_ROOT_2, REC_ROOT_2, 0}, {-1, 0, 0}},
+		facet_ref_normals = {
+			{0, -0.5, 0}, //makes consistency bc ref-line is length 2, wehereas triangle facets are not.
+			{0.5, 0.5, 0},
+			{-0.5, 0, 0},
+		},
 		sub_entity_verts = #partial{.D0 = {{0}, {1}, {2}}, .D1 = {{0, 1}, {1, 2}, {2, 0}}, .D2 = {{0, 1, 2}}},
 		sub_entity_edges = {},
 		orientation_perms = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}},
@@ -462,6 +538,23 @@ REF_TRI :: Reference_Element {
 		},
 	},
 	lagrange = {
+		.O0 = {
+			support = {{.D2, 0, 0}},
+			nodes = {{1.0 / 3.0, 1.0 / 3.0, 0}},
+			facet_restrictions = {{}, {}, {}},
+			vals = proc(dof: int, r: Ref_Vec) -> f64 {
+				switch dof {
+				case 0: return 1.0
+				case: unreachable()
+				}
+			},
+			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
+				switch dof {
+				case 0: return {0, 0, 0}
+				case: unreachable()
+				}
+			},
+		},
 		.O1 = {
 			support = {{.D0, 0, 0}, {.D0, 1, 0}, {.D0, 2, 0}},
 			nodes = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}},
@@ -517,7 +610,7 @@ REF_TRI :: Reference_Element {
 		},
 	},
 	rt = #partial{
-		.O1 = {
+		.O0 = {
 			support = {{.D1, 0, 0}, {.D1, 1, 0}, {.D1, 2, 0}},
 			facet_restrictions = {{0}, {1}, {2}},
 			sub_entity_perms = #partial{.Line = {{perm = {0}, sign = {1}}, {perm = {0}, sign = {-1}}}},
@@ -599,6 +692,23 @@ REF_QUAD :: Reference_Element {
 		},
 	},
 	lagrange = {
+		.O0 = {
+			support = {{.D2, 0, 0}},
+			nodes = {{0, 0, 0}},
+			facet_restrictions = {{}, {}, {}, {}},
+			vals = proc(dof: int, r: Ref_Vec) -> f64 {
+				switch dof {
+				case 0: return 1.0
+				case: unreachable()
+				}
+			},
+			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
+				switch dof {
+				case 0: return {0, 0, 0}
+				case: unreachable()
+				}
+			},
+		},
 		.O1 = {
 			support = {{.D0, 0, 0}, {.D0, 1, 0}, {.D0, 2, 0}, {.D0, 3, 0}},
 			nodes = {{-1, -1, 0}, {1, -1, 0}, {1, 1, 0}, {-1, 1, 0}},
@@ -691,7 +801,7 @@ REF_QUAD :: Reference_Element {
 		},
 	},
 	rt = #partial{
-		.O1 = {
+		.O0 = {
 			support = {{.D1, 0, 0}, {.D1, 1, 0}, {.D1, 2, 0}, {.D1, 3, 0}},
 			facet_restrictions = {{0}, {1}, {2}, {3}},
 			sub_entity_perms = #partial{.Line = {{perm = {0}, sign = {1}}, {perm = {0}, sign = {-1}}}},
@@ -776,6 +886,23 @@ REF_TET :: Reference_Element {
 		},
 	},
 	lagrange = {
+		.O0 = {
+			support = {{.D3, 0, 0}},
+			nodes = {{0.25, 0.25, 0.25}},
+			facet_restrictions = {{}, {}, {}, {}},
+			vals = proc(dof: int, r: Ref_Vec) -> f64 {
+				switch dof {
+				case 0: return 1.0
+				case: unreachable()
+				}
+			},
+			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
+				switch dof {
+				case 0: return {0, 0, 0}
+				case: unreachable()
+				}
+			},
+		},
 		.O1 = {
 			support = {{.D0, 0, 0}, {.D0, 1, 0}, {.D0, 2, 0}, {.D0, 3, 0}},
 			nodes = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}},
@@ -863,7 +990,7 @@ REF_TET :: Reference_Element {
 		},
 	},
 	rt = #partial{
-		.O1 = {
+		.O0 = {
 			support = {{.D2, 0, 0}, {.D2, 1, 0}, {.D2, 2, 0}, {.D2, 3, 0}},
 			facet_restrictions = {{0}, {1}, {2}, {3}},
 			sub_entity_perms = #partial{
@@ -987,6 +1114,23 @@ REF_HEX :: Reference_Element {
 		},
 	},
 	lagrange = {
+		.O0 = {
+			support = {{.D3, 0, 0}},
+			nodes = {{0, 0, 0}},
+			facet_restrictions = {{}, {}, {}, {}, {}, {}},
+			vals = proc(dof: int, r: Ref_Vec) -> f64 {
+				switch dof {
+				case 0: return 1.0
+				case: unreachable()
+				}
+			},
+			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
+				switch dof {
+				case 0: return {0, 0, 0}
+				case: unreachable()
+				}
+			},
+		},
 		.O1 = {
 			support = {
 				{.D0, 0, 0},
@@ -1200,7 +1344,7 @@ REF_HEX :: Reference_Element {
 		},
 	},
 	rt = #partial{
-		.O1 = {
+		.O0 = {
 			support = {{.D2, 0, 0}, {.D2, 1, 0}, {.D2, 2, 0}, {.D2, 3, 0}, {.D2, 4, 0}, {.D2, 5, 0}},
 			facet_restrictions = {{0}, {1}, {2}, {3}, {4}, {5}},
 			sub_entity_perms = #partial{
