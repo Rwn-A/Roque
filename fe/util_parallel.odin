@@ -2,13 +2,17 @@ package fe
 
 /*
  Parallel model based on https://www.dgtlgrove.com/p/multi-core-by-default.
- Does not follow article implementation exactly. Uses terminolog `rank` instead of `lane`
- used by the article as lane is reserved terminology for SIMD.
+ Does not follow the article implementation exactly. Uses the term `rank` instead of
+ the article's `lane`, as lane is reserved terminology for SIMD.
 
  This is a single program multiple data approach to parallelization.
- All ranks within a `widen` region must execute collective operations
- (`rank_sync`, `rank_reduce`, `rank_sync_value`, `narrow`, etc.) in the
- same order. Divergence between ranks may result in deadlock.
+
+ A "rank group" is the set of threads currently executing the same code together
+ (created by `widen`). Every thread always has a valid rank context: the zero value
+ of Rank_Ctx means "solo" (idx 0, count 1), so threads that were not created by
+ `widen` (main thread, foreign threads) need no setup.
+
+ Code that requires synchronization must be run by all ranks in the group to avoid deadlocks.
 */
 
 import "base:intrinsics"
@@ -22,18 +26,9 @@ rank_ctx: Rank_Ctx
 
 Rank_Ctx :: struct {
 	idx:         int,
-	count:       int,
+	count:       int, // 0 is treated as 1, see `rank_count`.
 	barrier:     ^sync.Barrier,
 	shared_ptrs: ^[MAX_RANKS]rawptr,
-}
-
-// main thread has valid context even without a `widen` call.
-@(init)
-init_default_rank_ctx :: proc "contextless" () {
-	rank_ctx = Rank_Ctx {
-		idx   = 0,
-		count = 1,
-	}
 }
 
 //== rank accessing
@@ -42,17 +37,20 @@ rank_idx :: proc() -> int {
 	return rank_ctx.idx
 }
 
+// Number of ranks, always >= 1.
 rank_count :: proc() -> int {
-	return rank_ctx.count
+	return max(rank_ctx.count, 1)
 }
 
 //== narrowing (temporarily single threaded execution)
 
-// Note: this is more ceremony then the article had, but its for running code that expects to be run in a rank
-// context run within a narrow. In the original article, narrow was simpler but would fail for code that expected a valid
-// rank context. Manual `if rank_idx() == 0 {...} rank_sync()` retains the articles semantics if needed.
+// Note: this is more ceremony than the article had, but it lets code that expects a valid rank
+// context run inside a narrow. In the original article, narrow was simpler but would fail for
+// code that expected a valid rank context. Manual `if rank_idx() == 0 {...} rank_sync()`
+// retains the article's semantics if needed.
 
-
+// Nested narrows are flat: once narrowed, further narrows only bump the depth.
+// This state describes the *current group level*, so `widen` saves and resets it.
 @(thread_local, private)
 narrow_saved_ctx: Rank_Ctx
 
@@ -84,6 +82,24 @@ narrow_end :: proc(was_narrowed: bool) {
 	rank_sync()
 }
 
+//== solo (all ranks think they are single-threaded)
+
+
+// Each rank believes its the only rank in a group, unlike narrow, where only one rank continues.
+// usage: `solo() ... sole_end()`.
+solo :: proc() -> Rank_Ctx {
+	saved := rank_ctx
+	rank_ctx = Rank_Ctx {
+		idx   = 0,
+		count = 1,
+	}
+	return saved
+}
+
+solo_end :: proc(saved: Rank_Ctx) {
+	rank_ctx = saved
+}
+
 //== synchronization
 
 // Block until all ranks have arrived
@@ -91,8 +107,8 @@ rank_sync :: proc() {
 	if rank_count() > 1 { sync.barrier_wait(rank_ctx.barrier) }
 }
 
-// This diverges from the article, there broadcast approach was faster but less flexible.
-// Warning: by defualt writes the value from rank 0, the default narrowing rank.
+// Copy `value` from `source_idx` into every other rank's `value`.
+// Warning: by default writes the value from rank 0, the default narrowing rank.
 rank_sync_value :: proc(value: ^$T, source_idx: int = 0) {
 	if rank_count() <= 1 { return }
 
@@ -111,23 +127,26 @@ rank_sync_value :: proc(value: ^$T, source_idx: int = 0) {
 	rank_sync()
 }
 
-// Combine all ranks `local` with the given procedure. For simple numerical types see `rank_sum`.
+// Combine all ranks' `local` with the given procedure. Every rank returns the same result.
+// For simple numerical types see `rank_sum`.
 rank_reduce :: proc(local: $T, $combine: proc(a, b: T) -> T) -> T {
 	if rank_count() <= 1 { return local }
-	result := local
-	rank_ctx.shared_ptrs[rank_idx()] = &result
+
+	mine := local
+	rank_ctx.shared_ptrs[rank_idx()] = &mine
 	rank_sync()
-	if narrow() {
-		for i in 1 ..< rank_count() {
-			other := (cast(^T)rank_ctx.shared_ptrs[i])^
-			result = combine(result, other)
-		}
+
+	result := (cast(^T)rank_ctx.shared_ptrs[0])^
+	for i in 1 ..< rank_count() {
+		result = combine(result, (cast(^T)rank_ctx.shared_ptrs[i])^)
 	}
-	rank_sync_value(&result)
+
+	// `mine` must outlive every rank's reads.
+	rank_sync()
 	return result
 }
 
-// Sum each ranks `local`. Given local must support `+` operator.
+// Sum each rank's `local`. Given local must support `+` operator.
 rank_sum :: proc(local: $T) -> T where intrinsics.type_is_numeric(T) {
 	return rank_reduce(local, proc(a, b: T) -> T { return a + b })
 }
@@ -138,9 +157,9 @@ Range :: struct {
 	min, max: int,
 }
 
-// Split count roughly equally among ranks, each rank will recieve its range.
+// Split count roughly equally among ranks, each rank will receive its range.
 rank_range :: proc(count: int) -> Range {
-	// Ripped directly from our boy Ryan Fluery
+	// Ripped directly from our boy Ryan Fleury
 	per := count / rank_count()
 	leftover := count % rank_count()
 	has_left := rank_idx() < leftover
@@ -150,35 +169,73 @@ rank_range :: proc(count: int) -> Range {
 	return Range{first, opl}
 }
 
+// This rank's portion of s, split the same way as rank_range(len(s)).
+rank_slice :: proc(s: []$T) -> []T {
+	r := rank_range(len(s))
+	return s[r.min:r.max]
+}
+
 //== Dynamic work distribution
 
+// The pool must be the same object on every rank (e.g. rank 0 owns it and broadcasts the
+// pointer with `rank_sync_value`, or it's created before `widen` and passed in through data).
 Task_Pool :: struct {
 	counter: int, // atomic
 	count:   int,
 }
 
+// create a task pool, all ranks must be supplying the same pool pointer.
 rank_task_pool_init :: proc(pool: ^Task_Pool, count: int) {
+	rank_sync()
 	if narrow() { pool.counter = 0; pool.count = count }
 }
 
+// Retrieve next task, returns false if theres no task left.
 rank_task_pool_next :: proc(pool: ^Task_Pool) -> (idx: int, ok: bool) {
 	idx = sync.atomic_add(&pool.counter, 1)
 	ok = idx < pool.count
 	return
 }
 
-//== Widening to mulit-rank context.
+/*
+Example: hand out variable-cost tasks dynamically (use when tasks outnumber ranks
+and cost varies; use `rank_range` when the work is uniform).
+  Job :: struct {
+      tasks:   []Task,
+      results: []Result,
+      pool:    Task_Pool,
+  }
+  process :: proc(job: ^Job) {
+      rank_task_pool_init(&job.pool, len(job.tasks))
+      for {
+          i := rank_task_pool_next(&job.pool) or_break
+          job.results[i] = run_task(job.tasks[i])
+      }
+      rank_sync()
+  }
+  widen(process, &job, 8)
+*/
 
-// Run the provided function in the widened-rank context, calling thread participates.
-// It is safe to widen, within a widen, but the inner work must end before the outer widen can continue.
+//== Widening to multi-rank context.
+
+// Run the provided function in the widened-rank context, calling thread participates as rank 0.
 widen :: proc(entry: proc(data: $T), data: T, rank_count: int) {
 	assert(rank_count > 0)
 	assert(rank_count <= MAX_RANKS, "rank_count exceeds MAX_RANKS")
+	assert(rank_count() <= 1, "Widening from multiple existing threads is probably a bad idea.")
 
 	scratch_guard()
 
+	// Save this thread's rank context and narrow state.
 	old_ctx := rank_ctx
-	defer rank_ctx = old_ctx
+	old_narrow_depth := narrow_depth
+	old_narrow_saved := narrow_saved_ctx
+	narrow_depth = 0
+	defer {
+		rank_ctx = old_ctx
+		narrow_depth = old_narrow_depth
+		narrow_saved_ctx = old_narrow_saved
+	}
 
 	// Serial fast path.
 	if rank_count == 1 {
@@ -197,7 +254,7 @@ widen :: proc(entry: proc(data: $T), data: T, rank_count: int) {
 
 	Thread_Params :: struct {
 		rank:  Rank_Ctx,
-		entry: proc(data: $T),
+		entry: proc(data: T),
 		data:  T,
 	}
 
@@ -229,4 +286,5 @@ widen :: proc(entry: proc(data: $T), data: T, rank_count: int) {
 	entry(data)
 
 	thread.join_multiple(..threads)
+	for t in threads { thread.destroy(t) }
 }

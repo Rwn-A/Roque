@@ -10,17 +10,7 @@ package fe
  are taken to be compile time known. These two quantities are generally fixed by the PDE, or for more
  dimensionally agnostic pdes, a function of the PDE and the dimension. With only these two dimensions compile time
  the element type, basis family, basis order & quadrature rule are flexible at runtime.
-
- The term vector/matrix describe its role in the discrete matrix form of the contraction. In reality even objetcs laballed
- `vec` are higher rank tensors.
 */
-
-CONTRACTION_AXIS :: enum {
-	CMPNTS,
-	FIELDS,
-}
-
-Contraction_Dims :: [CONTRACTION_AXIS]int
 
 Bvec :: struct(T: typeid) {
 	points, dofs, cmpnts: int,
@@ -63,8 +53,8 @@ Pvec_Point :: struct(T: typeid) {
 	data:           []T,
 }
 
-pvec_create :: proc($T: typeid, np: int, dims: Contraction_Dims, alloc := context.allocator) -> Pvec(T) {
-	return {np, dims[.CMPNTS], dims[.FIELDS], make([]T, np * dims[.FIELDS] * dims[.CMPNTS], alloc)}
+pvec_create :: proc($T: typeid, np, cmpnts, fields: int, alloc := context.allocator) -> Pvec(T) {
+	return {np, cmpnts, fields, make([]T, np * fields * cmpnts, alloc)}
 }
 
 pvec_at_point :: proc(pvec: Pvec($T), point: int) -> Pvec_Point(T) {
@@ -86,6 +76,12 @@ cvec_create :: proc($T: typeid, dofs, fields: int, alloc := context.allocator) -
 	return {dofs = dofs, fields = fields, data = make([]T, dofs * fields, alloc)}
 }
 
+// A cvec sized for contracting basis `b` with point data `p` (one field vector per basis dof).
+cvec_create_for :: proc(b: Bvec($BT), p: Pvec($T), alloc := context.allocator) -> Cvec(T) {
+	assert(b.cmpnts == p.cmpnts && b.points == p.points)
+	return cvec_create(T, b.dofs, p.fields, alloc)
+}
+
 // All field values for the dof
 cvec_dof_block :: proc(cvec: Cvec($T), dof: int) -> []T {
 	return cvec.data[dof * cvec.fields:][:cvec.fields]
@@ -95,6 +91,24 @@ cvec_dof_block :: proc(cvec: Cvec($T), dof: int) -> []T {
 cvec_dof_vec :: proc(cvec: Cvec($T), dof: int, $F: int) -> ^Small_Vec(F, T) {
 	assert(F == cvec.fields)
 	return small_vec_view_from_slice(cvec_dof_block(cvec, dof), F)
+}
+
+// c_dof = frames[dof] * c_dof. A length-1 slice applies one matrix to every dof.
+cvec_push_inplace :: proc(c: Cvec($T), frames: []Small_Mat($F, F, T)) {
+	assert(c.fields == F && (len(frames) == 1 || len(frames) == c.dofs))
+	for dof in 0 ..< c.dofs {
+		v := cvec_dof_vec(c, dof, F)
+		v^ = small_mat_vec_mul(frames[0 if len(frames) == 1 else dof], v^)
+	}
+}
+
+// c_dof = frames[dof]^T * c_dof. Scatter for a dual (residual, load) that was gathered with `frames`.
+cvec_push_inplace_t :: proc($F: int, c: Cvec($T), frames: []Small_Mat(F, F, T)) {
+	assert(c.fields == F && (len(frames) == 1 || len(frames) == c.dofs))
+	for dof in 0 ..< c.dofs {
+		v := cvec_dof_vec(c, dof, F)
+		v^ = small_mat_vec_mul_t(frames[0 if len(frames) == 1 else dof], v^)
+	}
 }
 
 Cmat :: struct(T: typeid) {
@@ -113,6 +127,14 @@ cmat_create :: proc($T: typeid, r_dofs, c_dofs: int, r_fields, c_fields: int, al
 	}
 }
 
+// A cmat sized for contracting row basis `rb` and column basis `cb` with point matrix `p`.
+// For a single shared basis pass it twice.
+cmat_create_for :: proc(rb: Bvec($BT), p: Pmat($T), cb: Bvec(BT), alloc := context.allocator) -> Cmat(T) {
+	assert(rb.cmpnts == p.layout.row_cmpnts && cb.cmpnts == p.layout.col_cmpnts)
+	assert(rb.points == p.points && cb.points == p.points)
+	return cmat_create(T, rb.dofs, cb.dofs, p.layout.row_fields, p.layout.col_fields, alloc)
+}
+
 // Returns the field block (column-field major) at the dof pair
 cmat_dof_block :: proc(cmat: Cmat($T), rdof, cdof: int) -> []T {
 	block_size := cmat.col_fields * cmat.row_fields
@@ -124,6 +146,37 @@ cmat_dof_block :: proc(cmat: Cmat($T), rdof, cdof: int) -> []T {
 // Returns a view of the (row_fields x col_fields) block coupling `rdof` and `cdof`.
 cmat_dof_matrix :: proc(cmat: Cmat($T), rdof, cdof: int, $RF, $CF: int) -> ^Small_Mat(RF, CF, T) {
 	return small_mat_view_from_slice(cmat_dof_block(cmat, rdof, cdof), RF, CF)
+}
+
+// K(rdof, cdof) = R_rdof * K * C_cdof^T.
+cmat_push_inplace :: proc(c: Cmat($T), rframes: []Small_Mat($RF, RF, T), cframes: []Small_Mat($CF, CF, T)) {
+	assert(c.row_fields == RF && c.col_fields == CF)
+	assert(len(rframes) == 1 || len(rframes) == c.row_dofs)
+	assert(len(cframes) == 1 || len(cframes) == c.col_dofs)
+	for rdof in 0 ..< c.row_dofs {
+		r := rframes[0 if len(rframes) == 1 else rdof]
+		for cdof in 0 ..< c.col_dofs {
+			blk := cmat_dof_matrix(c, rdof, cdof, RF, CF)
+			blk^ = small_mat_mul(
+				small_mat_mul(r, blk^),
+				small_mat_transpose(cframes[0 if len(cframes) == 1 else cdof]),
+			)
+		}
+	}
+}
+
+// K(rdof, cdof) = R_rdof^T * K * C_cdof.
+cmat_push_inplace_t :: proc(c: Cmat($T), rframes: []Small_Mat($RF, RF, T), cframes: []Small_Mat($CF, CF, T)) {
+	assert(c.row_fields == RF && c.col_fields == CF)
+	assert(len(rframes) == 1 || len(rframes) == c.row_dofs)
+	assert(len(cframes) == 1 || len(cframes) == c.col_dofs)
+	for rdof in 0 ..< c.row_dofs {
+		rt := small_mat_transpose(rframes[0 if len(rframes) == 1 else rdof])
+		for cdof in 0 ..< c.col_dofs {
+			blk := cmat_dof_matrix(c, rdof, cdof, RF, CF)
+			blk^ = small_mat_mul(small_mat_mul(rt, blk^), cframes[0 if len(cframes) == 1 else cdof])
+		}
+	}
 }
 
 
@@ -140,7 +193,8 @@ Pmat_Layout :: struct {
 	shape:                  Pmat_Shape,
 }
 
-// Shape describes the block-shape of the pmat, each field block is dense.
+// Shape describes the block-shape of the pmat (componext-aixs), each field block is dense.
+// DENSE and DIAGONAL field blocks may be rectangular. SYMMETRIC requires equal field counts.
 Pmat_Shape :: enum {
 	DENSE,
 	SYMMETRIC,
@@ -162,27 +216,27 @@ pmat_create :: proc(
 	$T: typeid,
 	np: int,
 	s: Pmat_Shape,
-	rd, cd: Contraction_Dims,
+	row_cmpnts, row_fields, col_cmpnts, col_fields: int,
 	alloc := context.allocator,
 ) -> Pmat(T) {
-	layout := Pmat_Layout{rd[.CMPNTS], rd[.FIELDS], cd[.CMPNTS], cd[.FIELDS], s}
+	layout := Pmat_Layout{row_cmpnts, row_fields, col_cmpnts, col_fields, s}
 
-	assert(s == .DENSE || layout.row_cmpnts == layout.col_cmpnts, "Non-dense shape requires equal component counts.")
+	assert(s == .DENSE || row_cmpnts == col_cmpnts, "Non-dense shape requires equal component counts.")
 
 	num_blocks: int
 	switch s {
-	case .DENSE: num_blocks = layout.row_cmpnts * layout.col_cmpnts
-	case .DIAGONAL: num_blocks = layout.row_cmpnts
+	case .DENSE: num_blocks = row_cmpnts * col_cmpnts
+	case .DIAGONAL: num_blocks = row_cmpnts
 	case .SYMMETRIC:
-		assert(rd[.FIELDS] == cd[.FIELDS], "Symmetry requires equal field counts.")
-		num_blocks = layout.row_cmpnts * (layout.row_cmpnts + 1) / 2
+		assert(row_fields == col_fields, "Symmetry requires equal field counts.")
+		num_blocks = row_cmpnts * (row_cmpnts + 1) / 2
 	}
-	data := make([]T, np * num_blocks * layout.row_fields * layout.col_fields, alloc)
+	data := make([]T, np * num_blocks * row_fields * col_fields, alloc)
 	return {points = np, layout = layout, field_blocks_per_point = num_blocks, data = data}
 }
 
-pmat_create_symmetric :: proc($T: typeid, np: int, d: Contraction_Dims, alloc := context.allocator) -> Pmat(T) {
-	return pmat_create(T, np, .SYMMETRIC, d, d, alloc)
+pmat_create_symmetric :: proc($T: typeid, np, cmpnts, fields: int, alloc := context.allocator) -> Pmat(T) {
+	return pmat_create(T, np, .SYMMETRIC, cmpnts, fields, cmpnts, fields, alloc)
 }
 
 pmat_at_point :: proc(pmat: Pmat($T), point: int) -> Pmat_Point(T) {
@@ -218,8 +272,7 @@ pmat_cmpnt_matrix :: proc(
 //== contractions
 
 // p = c * b
-contract_eval :: proc($dims: Contraction_Dims, p: Pvec($T), c: Cvec(T), b: Bvec($BT)) {
-	CM, FD :: dims[.CMPNTS], dims[.FIELDS]
+contract_eval :: proc($CM, $FD: int, p: Pvec($T), c: Cvec(T), b: Bvec($BT)) {
 	assert(p.cmpnts == CM && p.fields == FD && c.fields == FD && b.cmpnts == CM)
 	assert(b.dofs == c.dofs && p.points == b.points)
 
@@ -235,8 +288,7 @@ contract_eval :: proc($dims: Contraction_Dims, p: Pvec($T), c: Cvec(T), b: Bvec(
 
 
 // c += b * p
-contract_linear :: proc($dims: Contraction_Dims, c: Cvec($T), b: Bvec(T), p: Pvec(T)) {
-	CM, FD :: dims[.CMPNTS], dims[.FIELDS]
+contract_linear :: proc($CM, $FD: int, c: Cvec($T), b: Bvec(T), p: Pvec(T)) {
 	assert(p.cmpnts == CM && p.fields == FD && c.fields == FD && b.cmpnts == CM)
 	assert(b.dofs == c.dofs && p.points == b.points)
 
@@ -250,12 +302,13 @@ contract_linear :: proc($dims: Contraction_Dims, c: Cvec($T), b: Bvec(T), p: Pve
 }
 
 // c += rb * p * cb
-contract_bilinear :: proc($rd, $cd: Contraction_Dims, c: Cmat($T), rb: Bvec(T), p: Pmat(T), cb: Bvec(T)) {
-	RC, RF :: rd[.CMPNTS], rd[.FIELDS]
-	CC, CF :: cd[.CMPNTS], cd[.FIELDS]
+contract_bilinear :: proc($RC, $RF, $CC, $CF: int, c: Cmat($T), rb: Bvec(T), p: Pmat(T), cb: Bvec(T)) {
 	assert(rb.cmpnts == RC && cb.cmpnts == CC && c.row_fields == RF && c.col_fields == CF)
+	assert(p.layout.row_cmpnts == RC && p.layout.row_fields == RF)
+	assert(p.layout.col_cmpnts == CC && p.layout.col_fields == CF)
 	assert(c.row_dofs == rb.dofs && c.col_dofs == cb.dofs)
 	assert(p.points == rb.points && p.points == cb.points)
+	when RF != CF { assert(p.layout.shape != .SYMMETRIC, "Symmetric pmat requires equal field counts.") }
 
 	for point in 0 ..< p.points {
 		rbp, cbp, pp := bvec_at_point(rb, point), bvec_at_point(cb, point), pmat_at_point(p, point)
@@ -271,7 +324,9 @@ contract_bilinear :: proc($rd, $cd: Contraction_Dims, c: Cmat($T), rb: Bvec(T), 
 					switch status {
 					case .MISSING: continue
 					case .FOUND: small_mat_add_inplace(&pc[rc], block^, cv.data[cc])
-					case .TRANSPOSED: small_mat_add_inplace_t(&pc[rc], block^, cv.data[cc])
+					case .TRANSPOSED: when RF == CF {
+								small_mat_add_inplace_t(&pc[rc], block^, cv.data[cc])} else {unreachable()
+							}
 					}
 				}
 			}
@@ -286,27 +341,24 @@ contract_bilinear :: proc($rd, $cd: Contraction_Dims, c: Cmat($T), rb: Bvec(T), 
 
 // Same as contract bilinear but for cases where `p` is symmetric (.Symmetric or .Diagonal with matching field counts)
 // and the left and right basis are the same.
-contract_bilinear_same :: proc($rd, $cd: Contraction_Dims, c: Cmat($T), b: Bvec(T), p: Pmat(T)) {
-	RC, RF :: rd[.CMPNTS], rd[.FIELDS]
-	CC, CF :: cd[.CMPNTS], cd[.FIELDS]
-	#assert(RC == CC)
-	#assert(RF == CF)
-
-	assert(b.cmpnts == RC && c.row_fields == RF && c.col_fields == CF)
+contract_bilinear_same :: proc($CM, $FD: int, c: Cmat($T), b: Bvec(T), p: Pmat(T)) {
+	assert(b.cmpnts == CM && c.row_fields == FD && c.col_fields == FD)
+	assert(p.layout.row_cmpnts == CM && p.layout.row_fields == FD)
+	assert(p.layout.col_cmpnts == CM && p.layout.col_fields == FD)
 	assert(c.row_dofs == b.dofs && c.col_dofs == b.dofs)
 	assert(p.points == b.points)
 
 	for point in 0 ..< p.points {
 		bp, pp := bvec_at_point(b, point), pmat_at_point(p, point)
 		for cdof in 0 ..< b.dofs {
-			cv := bvec_dof_vec(bp, cdof, CC)
+			cv := bvec_dof_vec(bp, cdof, CM)
 			@(thread_local)
-			pc: [RC]Small_Mat(RF, CF, T)
+			pc: [CM]Small_Mat(FD, FD, T)
 
-			for rc in 0 ..< RC {
+			for rc in 0 ..< CM {
 				pc[rc] = {} //bc thread local
-				for cc in 0 ..< CC {
-					block, status := pmat_cmpnt_matrix(pp, rc, cc, RF, CF)
+				for cc in 0 ..< CM {
+					block, status := pmat_cmpnt_matrix(pp, rc, cc, FD, FD)
 					switch status {
 					case .MISSING: continue
 					case .FOUND: small_mat_add_inplace(&pc[rc], block^, cv.data[cc])
@@ -316,16 +368,15 @@ contract_bilinear_same :: proc($rd, $cd: Contraction_Dims, c: Cmat($T), b: Bvec(
 			}
 
 			for rdof in cdof ..< b.dofs {
-				rv := bvec_dof_vec(bp, rdof, RC)
+				rv := bvec_dof_vec(bp, rdof, CM)
 
-				delta: Small_Mat(RF, CF, T)
-				for rc in 0 ..< RC { small_mat_add_inplace(&delta, pc[rc], rv.data[rc]) }
+				delta: Small_Mat(FD, FD, T)
+				for rc in 0 ..< CM { small_mat_add_inplace(&delta, pc[rc], rv.data[rc]) }
 
-				dst := cmat_dof_matrix(c, rdof, cdof, RF, CF)
+				dst := cmat_dof_matrix(c, rdof, cdof, FD, FD)
 				small_mat_add_inplace(dst, delta, T(1))
-
 				if rdof != cdof {
-					dst_t := cmat_dof_matrix(c, cdof, rdof, RF, CF)
+					dst_t := cmat_dof_matrix(c, cdof, rdof, FD, FD)
 					small_mat_add_inplace_t(dst_t, delta, T(1))
 				}
 			}

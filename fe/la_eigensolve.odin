@@ -46,7 +46,7 @@ inexact_shift_lanczos :: proc(
 	scratch_guard()
 	context.allocator = scratch()
 
-	N := sp_rows(K.sp)
+	N := sp_n_rows(K.sp)
 	subspace_dim := subspace_dim
 	if subspace_dim > N { subspace_dim = N }
 
@@ -59,7 +59,7 @@ inexact_shift_lanczos :: proc(
 	q := make([]f64, N)
 	w := make([]f64, N)
 
-	K_shifted := sp_from_sparsity(K.sp)
+	K_shifted := sparse_from_sparsity(K.sp)
 
 	for idx in 0 ..< len(K.values) {
 		K_shifted.values[idx] = K.values[idx] - shift * M.values[idx]

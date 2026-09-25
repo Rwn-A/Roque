@@ -1,18 +1,11 @@
+/*
+
+*/
 package fe
 
-/*
- Reference element topology, quadrature & basis. Largely just access functions around tabulated data.
-
- Tables are updated as needed and may eventually be generated in a meta program.
-
- TOPOLOGY TERMNINOLOGY:
-  - Vertex (0D point)
- 	- Edge (1D line segment)
-  - Face (2D shape)
-  - Facet (Element dim - 1 entity, may be an edge, face, or vertex)
-*/
-
 import "core:slice"
+
+//== Types
 
 Element_Type :: enum {
 	Point,
@@ -30,62 +23,86 @@ Dimension :: enum {
 	D3,
 }
 
-// Order refers to increasing accuracy of approximation space, depending on what is applied to,
-// may not actually be equivalent to polynomial degree.
-Order :: enum {
-	O0,
-	O1,
-	O2,
-}
+Ref_Vec :: [3]f64
 
-// Basis families may not be defined over all element types.
-Basis_Family :: enum {
-	Lagrange,
-	Raviart_Thomas,
-}
+MAX_FACES       :: 6
+MAX_FACETS      :: 6
+MAX_EDGES       :: 12
+MAX_VERTICES    :: 8
 
-// Qn is high enough to inegrate polynomial of degree `n` exactly.
+// Qn is exact for degree n (per direction on quads/hexes, total on simplices).
 Quadrature_Set :: enum {
 	Q1,
 	Q3,
 	Q5,
+	Q7,
 }
-
-MAX_FACES    :: 6
-MAX_FACETS   :: 6
-MAX_EDGES    :: 12
-MAX_VERTICES :: 8
-
-Ref_Vec :: [3]f64
-
-Reference_Element :: struct {
-	topo:     Reference_Topology,
-	quad:     [Quadrature_Set]Reference_Quadrature,
-	lagrange: [Order]Reference_Lagrange,
-	rt:       [Order]Reference_RT,
-}
-
-// compile-time access if needed
-REFERENCE_ELEMENTS_CT :: [Element_Type]Reference_Element {
-	.Line  = REF_LINE,
-	.Point = REF_POINT,
-	.Tri   = REF_TRI,
-	.Quad  = REF_QUAD,
-	.Hex   = REF_HEX,
-	.Tet   = REF_TET,
-}
-
 
 @(rodata)
-REFERENCE_ELEMENTS := REFERENCE_ELEMENTS_CT
+QUAD_SET_DEGREE := [Quadrature_Set]int {
+	.Q1 = 1,
+	.Q3 = 3,
+	.Q5 = 5,
+	.Q7 = 7,
+}
+
+Order :: enum {
+	O0,
+	O1,
+	O2,
+	O3,
+}
+
+Basis_Family :: enum {
+	Lagrange,
+	Raviart_Thomas,
+	Nedelec,
+}
+
+Map_Type :: enum {
+	Unity,
+	Covariant,
+	Contravariant,
+	Density,
+}
+
+// S_ / V_: scalar or vector valued basis.
+Basis_Quantity :: enum {
+	S_Val,
+	V_Val,
+	S_Grd,
+	V_Div,
+	V_Curl,
+}
+
+@(rodata)
+BASIS_QUANTITIES := [Basis_Family]bit_set[Basis_Quantity] {
+	.Lagrange       = {.S_Val, .S_Grd},
+	.Raviart_Thomas = {.V_Val, .V_Div},
+	.Nedelec        = {.V_Val, .V_Curl},
+}
+
+// Components per dof, by element dimension.
+@(rodata, private = "file")
+QUANTITY_CMPNTS := [Basis_Quantity][Dimension]int {
+	.S_Val = {.D0 = 1, .D1 = 1, .D2 = 1, .D3 = 1},
+	.V_Val = {.D0 = 0, .D1 = 1, .D2 = 2, .D3 = 3},
+	.S_Grd = {.D0 = 0, .D1 = 1, .D2 = 2, .D3 = 3},
+	.V_Div = {.D0 = 1, .D1 = 1, .D2 = 1, .D3 = 1},
+	.V_Curl = {.D0 = 0, .D1 = 0, .D2 = 1, .D3 = 3},
+}
+
+Sub_Entity :: struct {
+	type:    Element_Type,
+	closure: [Dimension][]int, // Sub-entities of each dimension, as indices into the parent's sub_entities.
+}
 
 Reference_Topology :: struct {
 	dim:               Dimension,
-	facet_types:       []Element_Type,
-	facet_ref_normals: []Ref_Vec,
-	sub_entity_verts:  [Dimension][][]int, //sub-entity dimension
-	sub_entity_edges:  [][]int, // only exists for D3 elements.
-	orientation_perms: [][]int, // valid only for lines, quads, tris.
+	vertices:          []Ref_Vec,
+	sub_entities:      [Dimension][]Sub_Entity, // [dim][index] the cell itself is sub_entities[dim][0]
+	facet_normals:     []Ref_Vec, // Outward, length = facet size in the parent / facet size in its own reference
+	orientation_perms: [][]int, // [key][local vertex] -> position in canonical order. Line, Tri, Quad only.
 }
 
 Reference_Quadrature :: struct {
@@ -93,152 +110,156 @@ Reference_Quadrature :: struct {
 	weights: []f64,
 }
 
-Ref_Scalar_Val :: #type proc(idx: int, r: Ref_Vec) -> f64
-Ref_Vector_Val :: #type proc(idx: int, r: Ref_Vec) -> Ref_Vec
+// Fills every dof of one quantity at one point
+Basis_Eval :: #type proc(r: Ref_Vec, out: Bvec_Point(f64))
 
-Reference_Lagrange :: struct {
-	using core: Reference_Basis_Core,
-	nodes:      []Ref_Vec, // nodal coordinates of each dof (needed explicitly for dof functionals)
-	vals:       Ref_Scalar_Val,
-	grads:      Ref_Vector_Val,
+Orientation_Kind :: enum u8 {
+	Identity, // nothing to apply
+	Signed_Perm, // (M v)[i] = sign[i] * v[src[i]], and M^-T == M
+	Dense, // m and m_inv
 }
 
-Reference_RT :: struct {
-	using core: Reference_Basis_Core,
-	vals:       Ref_Vector_Val,
-	divs:       Ref_Scalar_Val,
+// M, where the cell's basis on the entity is phi_cell = M phi_ref.
+// Scatter uses M, gather M^T, interpolation M^-T. Only the fields for `kind` are set.
+Orientation_Transform :: struct {
+	kind:  Orientation_Kind,
+	src:   []int,
+	sign:  []f64,
+	m:     Dense_Matrix,
+	m_inv: Dense_Matrix,
 }
 
-Reference_Basis_Core :: struct {
-	facet_restrictions: [][]int, // includes dofs that are non zero anywhere on the facet
-	support:            []DOF_Support,
-	sub_entity_perms:   [Element_Type][]DOF_Perm,
+Rule :: struct {
+	element:    Element_Type, // in reference space of this element.
+	points: []Ref_Vec,
 }
 
-// Maps a local entity dof index (from support) to the reference orientations local entity index.
-// With an accomponying sign flip if appropiate.
-DOF_Perm :: struct {
-	perm: []int,
-	sign: []f64,
+// Functionals for all dofs on one entity, sharing one rule:
+//   l_j(v) = sum_p rule.weights[p] * sum_c weights[j][p][c] * v_c(x_p)
+//   x_p    = element_lift_to_parent_reference(et, dim, index, rule.ref_points[p])
+// Only the rule is in the entity's space. weights are in the parent's reference space.
+Entity_Functionals :: struct {
+	rule:    Rule,
+	weights: Bvec(f64),
 }
 
-// Topological support of a basis dof, used for building local to global maps.
-DOF_Support :: struct {
-	entity_dim:       Dimension,
-	entity_index:     int, // which local entity on the element
-	entity_dof_index: int, // which dof on this specific local entity
+Reference_Basis :: struct {
+	n_dofs:          int,
+	dofs_per_entity: [Dimension]int,
+	evals:           [Basis_Quantity]Basis_Eval, // nil if the family lacks the quantity
+	orientations:    [Element_Type][]Orientation_Transform, // [entity type][key]; nil = never transformed
+	functionals:     [Dimension][]Entity_Functionals, // [dim][entity]
 }
 
-//== Wrapped table accessors & higher level helpers
+Reference_Element :: struct {
+	topology:   Reference_Topology,
+	quadrature: [Quadrature_Set]Reference_Quadrature,
+	bases:      [Basis_Family][Order]Reference_Basis,
+}
+
+//== Element
+
+Reference_Facet :: struct {
+	using entity: Sub_Entity,
+	dim:          Dimension,
+	normal:       []f64, // len = element dimension
+}
 
 element_dim :: proc(et: Element_Type) -> Dimension {
-	return REFERENCE_ELEMENTS[et].topo.dim
+	return REFERENCE_ELEMENTS[et].topology.dim
 }
 
-element_num_nodes :: proc(et: Element_Type, order: Order) -> int {
-	return len(REFERENCE_ELEMENTS[et].lagrange[order].nodes)
-}
-
-element_quad_rule :: proc(et: Element_Type, set: Quadrature_Set) -> Rule {
-	q := REFERENCE_ELEMENTS[et].quad[set]
-	return {et, q.points, q.weights}
+element_num_sub_entities :: proc(et: Element_Type, dim: Dimension) -> int {
+	return len(REFERENCE_ELEMENTS[et].topology.sub_entities[dim])
 }
 
 element_num_facets :: proc(et: Element_Type) -> int {
+	return len(REFERENCE_ELEMENTS[et].topology.facet_normals)
+}
+
+// dim == element_dim(et), index 0 is the cell itself.
+element_sub_entity :: proc(et: Element_Type, dim: Dimension, index: int) -> Sub_Entity {
+	assert(dim <= element_dim(et))
+	return REFERENCE_ELEMENTS[et].topology.sub_entities[dim][index]
+}
+
+element_facet :: proc(et: Element_Type, facet: int) -> Reference_Facet {
 	assert(et != .Point)
-	return len(REFERENCE_ELEMENTS[et].topo.facet_types)
+	fd := element_dim(et) - Dimension(1)
+	t := &REFERENCE_ELEMENTS[et].topology
+	return {entity = t.sub_entities[fd][facet], dim = fd, normal = t.facet_normals[facet][:int(element_dim(et))]}
 }
 
-element_facet_dim :: proc(et: Element_Type) -> Dimension {
-	assert(et != .Point)
-	return REFERENCE_ELEMENTS[element_facet_type(et, 0)].topo.dim
+element_vertex_coord :: proc(et: Element_Type, vert: int) -> Ref_Vec {
+	return REFERENCE_ELEMENTS[et].topology.vertices[vert]
 }
 
-element_facet_type :: proc(et: Element_Type, facet: int) -> Element_Type {
-	assert(et != .Point)
-	return REFERENCE_ELEMENTS[et].topo.facet_types[facet]
+// Maps a point in a sub-entity's own reference space into the element's reference space.
+element_lift_to_parent_reference :: proc(et: Element_Type, dim: Dimension, index: int, point: Ref_Vec) -> Ref_Vec {
+	assert(dim <= element_dim(et))
+	if element_dim(et) == dim { return point }
+
+	sub := element_sub_entity(et, dim, index)
+	buf: [MAX_VERTICES]f64
+	phi := p1_values(sub.type, point, buf[:])
+
+	r: Ref_Vec
+	for v, k in sub.closure[.D0] { r += phi[k] * element_vertex_coord(et, v) }
+	return r
 }
 
-// Returns the local edge indices for the given element that make up the given facet.
-element_facet_edges :: proc(et: Element_Type, facet: int) -> []int {
-	assert(element_dim(et) == .D3, "Only 3D element facets have edges.")
-	return REFERENCE_ELEMENTS[et].topo.sub_entity_edges[facet]
-}
-
-// Returns the local node indices for the given element at the given order for the facet.
-element_facet_verts :: proc(et: Element_Type, facet: int) -> []int {
-	assert(et != .Point)
-	return REFERENCE_ELEMENTS[et].topo.sub_entity_verts[element_facet_dim(et)][facet]
-}
-
-// Returns the reference facet normal as a small vector for use in geometry, I must be the intrinsic dimension of `et`
-element_facet_ref_normal :: proc($T: typeid, $I: int, et: Element_Type, facet: int) -> Small_Vec(I, T) {
-	assert(et != .Point)
-	assert(I == int(element_dim(et)))
-	return small_vec_from_slice(T, REFERENCE_ELEMENTS[et].topo.facet_ref_normals[facet][:], I)
-}
-
-// Find orientation key from a given vertex order, based on the target order.
+// Orientation key of an entity. local_order: its vertices as this cell sees them.
+// target_order: the same vertices in the entity's canonical (mesh-wide) order.
 element_orientation :: proc(et: Element_Type, local_order: []$T, target_order: []T) -> u8 {
 	n := len(local_order)
-	assert(n == len(target_order))
+	assert(n == len(target_order) && n <= MAX_VERTICES)
 
-	PERM_BUFFER := [128]int{}
-
+	perm: [MAX_VERTICES]int
 	for v, i in local_order {
 		idx, found := slice.linear_search(target_order, v)
 		assert(found, "local_order and target_order are not the same vertex set")
-		PERM_BUFFER[i] = idx
+		perm[i] = idx
 	}
 
-	table := REFERENCE_ELEMENTS[et].topo.orientation_perms
-	assert(table != nil, "element type has no orientation symmetry group")
+	table := REFERENCE_ELEMENTS[et].topology.orientation_perms
+	assert(table != nil, "element type has no orientations")
 	for row, i in table {
-		if slice.equal(row, PERM_BUFFER[:len(local_order)]) { return u8(i) }
+		if slice.equal(row, perm[:n]) { return u8(i) }
 	}
-
-	panic("vertex correspondence is not a valid symmetry for this facet type")
+	panic("vertex order is not a symmetry of this element type")
 }
 
-// Move a point from the reference space of the elements facet to the given elements ref space.
-// In the interest of surface quadrature.
-lift_to_parent_reference :: proc(et: Element_Type, facet: int, facet_point: Ref_Vec) -> Ref_Vec {
-	assert(et != .Point)
-	switch et {
-	case .Point: unreachable()
-	case .Line: return facet == 0 ? {-1, 0, 0} : {1, 0, 0}
-	case .Tri: switch facet {
-			case 0: return {facet_point.x, 0, 0}
-			case 1: return {1 - facet_point.x, facet_point.x, 0}
-			case 2: return {0, 1 - facet_point.x, 0}
-			case: unreachable()
-			}
-	case .Quad: switch facet {
-			case 0: return {facet_point.x, -1, 0}
-			case 1: return {1, facet_point.x, 0}
-			case 2: return {facet_point.x, 1, 0}
-			case 3: return {-1, facet_point.x, 0}
-			case: unreachable()
-			}
-	case .Tet: switch facet {
-			case 0: return {facet_point.x, facet_point.y, 0}
-			case 1: return {facet_point.x, 0, facet_point.y}
-			case 2: return {0, facet_point.x, facet_point.y}
-			case 3: return {1 - facet_point.x - facet_point.y, facet_point.x, facet_point.y}
-			case: unreachable()
-			}
-	case .Hex: switch facet {
-			case 0: return {facet_point.x, facet_point.y, -1}
-			case 1: return {facet_point.x, facet_point.y, +1}
-			case 2: return {facet_point.x, -1, facet_point.y}
-			case 3: return {facet_point.x, +1, facet_point.y}
-			case 4: return {-1, facet_point.x, facet_point.y}
-			case 5: return {+1, facet_point.x, facet_point.y}
-			case: unreachable()
-			}
-	case: unreachable()
-	}
+// Maps a point in the entity's reference space to where it sits under orientation key `k`.
+element_orient_point :: proc(et: Element_Type, k: u8, p: Ref_Vec) -> (r: Ref_Vec) {
+	if k == 0 { return p }
+	perm := REFERENCE_ELEMENTS[et].topology.orientation_perms[k]
+	buf: [MAX_VERTICES]f64
+	phi := p1_values(et, p, buf[:])
+	for i in 0 ..< len(perm) { r += phi[perm[i]] * element_vertex_coord(et, i) }
+	return r
 }
+
+element_quadrature_rule :: proc(et: Element_Type, set: Quadrature_Set) -> (Rule, []f64) {
+	q := REFERENCE_ELEMENTS[et].quadrature[set]
+	assert(len(q.points) > 0 && len(q.points) == len(q.weights), "quadrature set is not tabulated")
+	return {element = et, points = q.points}, q.weights
+}
+
+// Vertex (P1) shape function values at r, written into buf.
+@(private = "file")
+p1_values :: proc(et: Element_Type, r: Ref_Vec, buf: []f64) -> []f64 {
+	n := len(REFERENCE_ELEMENTS[et].topology.vertices)
+	assert(n <= len(buf))
+	out := Bvec_Point(f64) {
+		dofs   = n,
+		cmpnts = 1,
+		data   = buf[:n],
+	}
+	REFERENCE_ELEMENTS[et].bases[.Lagrange][.O1].evals[.S_Val](r, out)
+	return buf[:n]
+}
+
+//== Basis
 
 Basis_Desc :: struct {
 	element: Element_Type,
@@ -246,1137 +267,114 @@ Basis_Desc :: struct {
 	order:   Order,
 }
 
-Basis_Quantity :: enum {
-	S_Val,
-	V_Val,
-	S_Grd,
-	V_Div,
+basis_is_defined :: proc(bd: Basis_Desc) -> bool {
+	return basis_ref(bd).n_dofs > 0
 }
 
-@(rodata)
-BASIS_QUANTITIES := [Basis_Family]bit_set[Basis_Quantity] {
-	.Lagrange       = {.S_Val, .S_Grd},
-	.Raviart_Thomas = {.V_Val, .V_Div},
+basis_num_dofs :: proc(bd: Basis_Desc) -> int {
+	return basis_ref(bd).n_dofs
 }
 
-// Generalization of a quadrature rule
-Rule :: struct {
-	element:    Element_Type, // points are in ref space of this elem.
-	ref_points: []Ref_Vec,
-	weights:    []f64, // optional
+basis_dofs_per_entity :: proc(bd: Basis_Desc, dim: Dimension) -> int {
+	return basis_ref(bd).dofs_per_entity[dim]
 }
 
-// Rough heuristic of 2 * basis order as polynomial degree to be integrated.
-basis_infer_quad :: proc(bd: Basis_Desc) -> Rule {
-	o := (int(bd.order)) * 2
-	switch {
-	case o <= 1: return element_quad_rule(bd.element, .Q1)
-	case o <= 3: return element_quad_rule(bd.element, .Q3)
-	case o <= 5: return element_quad_rule(bd.element, .Q5)
-	case: return element_quad_rule(bd.element, .Q5)
+// Dofs owned by one sub-entity: local dofs [start, start + count).
+basis_entity_dof_range :: proc(bd: Basis_Desc, dim: Dimension, index: int) -> (start, count: int) {
+	assert(dim <= element_dim(bd.element) && basis_is_defined(bd))
+	b := basis_ref(bd)
+	for d in 0 ..< int(dim) {
+		start += element_num_sub_entities(bd.element, Dimension(d)) * b.dofs_per_entity[Dimension(d)]
 	}
+	count = b.dofs_per_entity[dim]
+	start += index * count
+	return
 }
 
-// how many scalars are needed to represent the quantity in reference space.
-basis_quantity_components :: proc(et: Element_Type, qty: Basis_Quantity) -> int {
-	switch qty {
-	case .S_Val, .V_Div: return 1
-	case .V_Val, .S_Grd: return int(element_dim(et))
-	case: unreachable()
-	}
-}
-
-basis_info_core :: proc(bd: Basis_Desc) -> Reference_Basis_Core {
-	switch bd.family {
-	case .Lagrange: return REFERENCE_ELEMENTS[bd.element].lagrange[bd.order]
-	case .Raviart_Thomas: return REFERENCE_ELEMENTS[bd.element].rt[bd.order]
-	case: unreachable()
-	}
-}
-
-// Returns all local dofs which are non-zero on the given facet
-// not just topologically facet-supported dofs.
-basis_facet_restriction :: proc(bd: Basis_Desc, facet: int) -> []int {
-	assert(bd.element != .Point)
-	return basis_info_core(bd).facet_restrictions[facet]
-}
-
-basis_count :: proc(bd: Basis_Desc) -> int {
-	return len(basis_support(bd))
-}
-
-basis_support :: proc(bd: Basis_Desc) -> []DOF_Support {
-	return basis_info_core(bd).support
-}
-
-// permutation for dofs on the sub entity, only dofs that are supported by the sub entity directly.
-basis_sub_entity_perm :: proc(bd: Basis_Desc, sub_entity: Element_Type, orientation: u8) -> DOF_Perm {
-	assert(sub_entity == .Line || sub_entity == .Tri || sub_entity == .Quad, "Sub entity does not have a permuation")
-	assert(element_dim(sub_entity) < element_dim(bd.element))
-	return basis_info_core(bd).sub_entity_perms[sub_entity][orientation]
-}
-
-// `local` is the `entity_dof_index` for the given `sub_et`.
-basis_orient_dof :: proc(bd: Basis_Desc, sub_et: Element_Type, orientation: u8, local: int) -> (dof: int, flip: bool) {
-	perm := basis_sub_entity_perm(bd, sub_et, orientation)
-	return perm.perm[local], perm.sign[local] == -1
-}
-
-// Functional points & points as a "Rule". The coefficient for the dof is given as:
-// sum(value_p * weight_p) where the sum is over points (p). What value means depends on the basis.
-basis_functional_rule :: proc(bd: Basis_Desc, dof: int) -> Rule {
-	core := basis_info_core(bd)
-	sup := core.support[dof]
-
-	switch bd.family {
-	case .Lagrange:
-		lag := REFERENCE_ELEMENTS[bd.element].lagrange[bd.order]
-		return Rule{element = bd.element, ref_points = lag.nodes[dof:dof + 1], weights = nil}
-	case .Raviart_Thomas:
-		assert(element_facet_dim(bd.element) == sup.entity_dim, "Unimplemented: Interior RT basis")
-
-		ft := element_facet_type(bd.element, sup.entity_index)
-		switch bd.order {
-		case .O0: return element_quad_rule(ft, .Q1)
-		case .O1: return element_quad_rule(ft, .Q3)
-		case .O2: return element_quad_rule(ft, .Q5)
-		case: unreachable()
+// Dofs of a sub-entity and everything on its boundary.
+basis_closure_dofs :: proc(bd: Basis_Desc, entity: Sub_Entity, alloc := context.allocator) -> []int {
+	assert(basis_is_defined(bd))
+	out := make([dynamic]int, alloc)
+	for dim in Dimension {
+		for e in entity.closure[dim] {
+			start, count := basis_entity_dof_range(bd, dim, e)
+			for d in start ..< start + count { append(&out, d) }
 		}
-	case: unreachable()
 	}
+	return out[:]
+}
+
+// Dofs with a non-zero trace on the facet.
+basis_facet_dofs :: proc(bd: Basis_Desc, facet: int, alloc := context.allocator) -> []int {
+	return basis_closure_dofs(bd, element_facet(bd.element, facet), alloc)
 }
 
 
-//== Raw tables
-
-ROOT_3     :: 1.73205080757
-REC_ROOT_3 :: 1.0 / ROOT_3
-ROOT_3_5   :: 0.7745966692414834
-ROOT_2     :: 1.41421356237
-REC_ROOT_2 :: 1.0 / ROOT_2
-
-REF_POINT :: Reference_Element {
-	topo = {
-		dim = .D0,
-		facet_types = {},
-		facet_ref_normals = {},
-		sub_entity_verts = #partial{.D0 = {{0}}},
-		sub_entity_edges = {},
-		orientation_perms = {},
-	},
-	quad = [Quadrature_Set]Reference_Quadrature {
-		.Q1 = {points = {{0, 0, 0}}, weights = {1}},
-		.Q3 = {points = {{0, 0, 0}}, weights = {1}},
-		.Q5 = {points = {{0, 0, 0}}, weights = {1}},
-	},
-	lagrange = {
-		.O0 = {
-			support = {{.D0, 0, 0}},
-			nodes = {{0, 0, 0}},
-			facet_restrictions = {},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				switch dof {
-				case 0: return 1.0
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				switch dof {
-				case 0: return {0, 0, 0}
-				case: unreachable()
-				}
-			},
-		},
-		.O1 = {
-			support = {{.D0, 0, 0}},
-			nodes = {{0, 0, 0}},
-			facet_restrictions = {},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				switch dof {
-				case 0: return 1.0
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				switch dof {
-				case 0: return {0, 0, 0}
-				case: unreachable()
-				}
-			},
-		},
-		.O2 = {
-			support = {{.D0, 0, 0}},
-			nodes = {{0, 0, 0}},
-			facet_restrictions = {},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				switch dof {
-				case 0: return 1.0
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				switch dof {
-				case 0: return {0, 0, 0}
-				case: unreachable()
-				}
-			},
-		},
-	},
+// Components per dof: the cmpnts to tabulate into.
+basis_quantity_cmpnts :: proc(bd: Basis_Desc, q: Basis_Quantity) -> int {
+	assert(q in BASIS_QUANTITIES[bd.family])
+	return QUANTITY_CMPNTS[q][element_dim(bd.element)]
 }
 
-REF_LINE :: Reference_Element {
-	topo = {
-		dim = .D1,
-		facet_types = {.Point, .Point},
-		facet_ref_normals = {{-1, 0, 0}, {+1, 0, 0}},
-		sub_entity_verts = #partial{.D0 = {{0}, {1}}},
-		sub_entity_edges = {},
-		orientation_perms = {{0, 1}, {1, 0}},
-	},
-	quad = {
-		.Q1 = {points = {{0, 0, 0}}, weights = {2}},
-		.Q3 = {points = {{-REC_ROOT_3, 0, 0}, {REC_ROOT_3, 0, 0}}, weights = {1, 1}},
-		.Q5 = {points = {{-ROOT_3_5, 0, 0}, {0, 0, 0}, {ROOT_3_5, 0, 0}}, weights = {5.0 / 9, 8.0 / 9, 5.0 / 9}},
-	},
-	lagrange = {
-		.O0 = {
-			support = {{.D1, 0, 0}},
-			nodes = {{0, 0, 0}},
-			facet_restrictions = {{}, {}},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				switch dof {
-				case 0: return 1.0
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				switch dof {
-				case 0: return {0, 0, 0}
-				case: unreachable()
-				}
-			},
-		},
-		.O1 = {
-			support = {{.D0, 0, 0}, {.D0, 1, 0}},
-			nodes = {{-1, 0, 0}, {1, 0, 0}},
-			facet_restrictions = {{0}, {1}},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				switch dof {
-				case 0: return (1.0 - r.x) / 2.0
-				case 1: return (1.0 + r.x) / 2.0
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				switch dof {
-				case 0: return {-0.5, 0, 0}
-				case 1: return {0.5, 0, 0}
-				case: unreachable()
-				}
-			},
-		},
-		.O2 = {
-			support = {{.D0, 0, 0}, {.D0, 1, 0}, {.D1, 0, 0}},
-			nodes = {{-1, 0, 0}, {1, 0, 0}, {0, 0, 0}},
-			facet_restrictions = {{0}, {1}},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				switch dof {
-				case 0: return -r.x * (1.0 - r.x) / 2.0
-				case 1: return r.x * (1.0 + r.x) / 2.0
-				case 2: return 1.0 - r.x * r.x
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				switch dof {
-				case 0: return {-(1.0 - 2.0 * r.x) / 2.0, 0, 0}
-				case 1: return {(1.0 + 2.0 * r.x) / 2.0, 0, 0}
-				case 2: return {-2.0 * r.x, 0, 0}
-				case: unreachable()
-				}
-			},
-		},
-	},
+basis_eval :: proc(bd: Basis_Desc, q: Basis_Quantity, r: Ref_Vec, out: Bvec_Point(f64)) {
+	eval := basis_ref(bd).evals[q]
+	assert(eval != nil, "quantity not tabulated for this basis")
+	assert(out.dofs == basis_num_dofs(bd) && out.cmpnts == basis_quantity_cmpnts(bd, q))
+	eval(r, out)
 }
 
-REF_TRI :: Reference_Element {
-	topo = {
-		dim = .D2,
-		facet_types = {.Line, .Line, .Line},
-		facet_ref_normals = {
-			{0, -0.5, 0}, //makes consistency bc ref-line is length 2, wehereas triangle facets are not.
-			{0.5, 0.5, 0},
-			{-0.5, 0, 0},
-		},
-		sub_entity_verts = #partial{.D0 = {{0}, {1}, {2}}, .D1 = {{0, 1}, {1, 2}, {2, 0}}, .D2 = {{0, 1, 2}}},
-		sub_entity_edges = {},
-		orientation_perms = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}},
-	},
-	quad = [Quadrature_Set]Reference_Quadrature {
-		.Q1 = {points = {{1.0 / 3.0, 1.0 / 3.0, 0}}, weights = {0.5}},
-		.Q3 = {
-			points = {{1.0 / 6.0, 1.0 / 6.0, 0}, {2.0 / 3.0, 1.0 / 6.0, 0}, {1.0 / 6.0, 2.0 / 3.0, 0}},
-			weights = {1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0},
-		},
-		.Q5 = {
-			points = {
-				{0.091576213509771, 0.091576213509771, 0},
-				{0.816847572980459, 0.091576213509771, 0},
-				{0.091576213509771, 0.816847572980459, 0},
-				{0.445948490915965, 0.108103018168070, 0},
-				{0.108103018168070, 0.445948490915965, 0},
-				{0.445948490915965, 0.445948490915965, 0},
-			},
-			weights = {
-				0.054975871827661,
-				0.054975871827661,
-				0.054975871827661,
-				0.111690794839005,
-				0.111690794839005,
-				0.111690794839005,
-			},
-		},
-	},
-	lagrange = {
-		.O0 = {
-			support = {{.D2, 0, 0}},
-			nodes = {{1.0 / 3.0, 1.0 / 3.0, 0}},
-			facet_restrictions = {{}, {}, {}},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				switch dof {
-				case 0: return 1.0
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				switch dof {
-				case 0: return {0, 0, 0}
-				case: unreachable()
-				}
-			},
-		},
-		.O1 = {
-			support = {{.D0, 0, 0}, {.D0, 1, 0}, {.D0, 2, 0}},
-			nodes = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}},
-			facet_restrictions = {{0, 1}, {1, 2}, {2, 0}},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				switch dof {
-				case 0: return 1.0 - r.x - r.y
-				case 1: return r.x
-				case 2: return r.y
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				switch dof {
-				case 0: return {-1, -1, 0}
-				case 1: return {1, 0, 0}
-				case 2: return {0, 1, 0}
-				case: unreachable()
-				}
-			},
-		},
-		.O2 = {
-			support = {{.D0, 0, 0}, {.D0, 1, 0}, {.D0, 2, 0}, {.D1, 0, 0}, {.D1, 1, 0}, {.D1, 2, 0}},
-			nodes = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0.5, 0, 0}, {0.5, 0.5, 0}, {0, 0.5, 0}},
-			facet_restrictions = {{0, 1, 3}, {1, 2, 4}, {2, 0, 5}},
-			sub_entity_perms = #partial{.Line = {{perm = {0}, sign = {1}}, {perm = {0}, sign = {1}}}},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				x, y := r.x, r.y
-				l0 := 1.0 - x - y
-				switch dof {
-				case 0: return l0 * (2.0 * l0 - 1.0)
-				case 1: return x * (2.0 * x - 1.0)
-				case 2: return y * (2.0 * y - 1.0)
-				case 3: return 4.0 * l0 * x
-				case 4: return 4.0 * x * y
-				case 5: return 4.0 * y * l0
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				x, y := r.x, r.y
-				switch dof {
-				case 0:
-					v := 4.0 * x + 4.0 * y - 3.0; return {v, v, 0}
-				case 1: return {4.0 * x - 1.0, 0, 0}
-				case 2: return {0, 4.0 * y - 1.0, 0}
-				case 3: return {4.0 - 8.0 * x - 4.0 * y, -4.0 * x, 0}
-				case 4: return {4.0 * y, 4.0 * x, 0}
-				case 5: return {-4.0 * y, 4.0 - 4.0 * x - 8.0 * y, 0}
-				case: unreachable()
-				}
-			},
-		},
-	},
-	rt = #partial{
-		.O0 = {
-			support = {{.D1, 0, 0}, {.D1, 1, 0}, {.D1, 2, 0}},
-			facet_restrictions = {{0}, {1}, {2}},
-			sub_entity_perms = #partial{.Line = {{perm = {0}, sign = {1}}, {perm = {0}, sign = {-1}}}},
-			vals = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				x, y := r.x, r.y
-				switch dof {
-				case 0: return {x, y - 1.0, 0}
-				case 1: return {x, y, 0}
-				case 2: return {x - 1.0, y, 0}
-				case: unreachable()
-				}
-			},
-			divs = proc(dof: int, r: Ref_Vec) -> f64 {
-				switch dof {
-				case 0, 1, 2: return 2.0
-				case: unreachable()
-				}
-			},
-		},
-	},
+basis_entity_functionals :: proc(bd: Basis_Desc, dim: Dimension, index: int) -> Entity_Functionals {
+	assert(dim <= element_dim(bd.element) && basis_is_defined(bd))
+	return basis_ref(bd).functionals[dim][index]
 }
 
-REF_QUAD :: Reference_Element {
-	topo = {
-		dim = .D2,
-		facet_types = {.Line, .Line, .Line, .Line},
-		facet_ref_normals = {{0, -1, 0}, {+1, 0, 0}, {0, +1, 0}, {-1, 0, 0}},
-		sub_entity_verts = #partial{
-			.D0 = {{0}, {1}, {2}, {3}},
-			.D1 = {{0, 1}, {1, 2}, {2, 3}, {3, 0}},
-			.D2 = {{0, 1, 2, 3}},
-		},
-		sub_entity_edges = {},
-		orientation_perms = {
-			{0, 1, 2, 3},
-			{1, 2, 3, 0},
-			{2, 3, 0, 1},
-			{3, 0, 1, 2},
-			{0, 3, 2, 1},
-			{3, 2, 1, 0},
-			{2, 1, 0, 3},
-			{1, 0, 3, 2},
-		},
-	},
-	quad = [Quadrature_Set]Reference_Quadrature {
-		.Q1 = {points = {{0, 0, 0}}, weights = {4}},
-		.Q3 = {
-			points = {
-				{-REC_ROOT_3, -REC_ROOT_3, 0},
-				{REC_ROOT_3, -REC_ROOT_3, 0},
-				{REC_ROOT_3, REC_ROOT_3, 0},
-				{-REC_ROOT_3, REC_ROOT_3, 0},
-			},
-			weights = {1, 1, 1, 1},
-		},
-		.Q5 = {
-			points = {
-				{-ROOT_3_5, -ROOT_3_5, 0},
-				{0., -ROOT_3_5, 0},
-				{ROOT_3_5, -ROOT_3_5, 0},
-				{-ROOT_3_5, 0., 0},
-				{0., 0., 0},
-				{ROOT_3_5, 0., 0},
-				{-ROOT_3_5, ROOT_3_5, 0},
-				{0., ROOT_3_5, 0},
-				{ROOT_3_5, ROOT_3_5, 0},
-			},
-			weights = {
-				25. / 81.,
-				40. / 81.,
-				25. / 81.,
-				40. / 81.,
-				64. / 81.,
-				40. / 81.,
-				25. / 81.,
-				40. / 81.,
-				25. / 81.,
-			},
-		},
-	},
-	lagrange = {
-		.O0 = {
-			support = {{.D2, 0, 0}},
-			nodes = {{0, 0, 0}},
-			facet_restrictions = {{}, {}, {}, {}},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				switch dof {
-				case 0: return 1.0
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				switch dof {
-				case 0: return {0, 0, 0}
-				case: unreachable()
-				}
-			},
-		},
-		.O1 = {
-			support = {{.D0, 0, 0}, {.D0, 1, 0}, {.D0, 2, 0}, {.D0, 3, 0}},
-			nodes = {{-1, -1, 0}, {1, -1, 0}, {1, 1, 0}, {-1, 1, 0}},
-			facet_restrictions = {{0, 1}, {1, 2}, {2, 3}, {3, 0}},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				x, y := r.x, r.y
-				switch dof {
-				case 0: return (1.0 - x) * (1.0 - y) / 4.0
-				case 1: return (1.0 + x) * (1.0 - y) / 4.0
-				case 2: return (1.0 + x) * (1.0 + y) / 4.0
-				case 3: return (1.0 - x) * (1.0 + y) / 4.0
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				x, y := r.x, r.y
-				switch dof {
-				case 0: return {-(1.0 - y) / 4.0, -(1.0 - x) / 4.0, 0}
-				case 1: return {(1.0 - y) / 4.0, -(1.0 + x) / 4.0, 0}
-				case 2: return {(1.0 + y) / 4.0, (1.0 + x) / 4.0, 0}
-				case 3: return {-(1.0 + y) / 4.0, (1.0 - x) / 4.0, 0}
-				case: unreachable()
-				}
-			},
-		},
-		.O2 = {
-			support = {
-				{.D0, 0, 0},
-				{.D0, 1, 0},
-				{.D0, 2, 0},
-				{.D0, 3, 0},
-				{.D1, 0, 0},
-				{.D1, 1, 0},
-				{.D1, 2, 0},
-				{.D1, 3, 0},
-				{.D2, 0, 0},
-			},
-			nodes = {
-				{-1, -1, 0},
-				{1, -1, 0},
-				{1, 1, 0},
-				{-1, 1, 0},
-				{0, -1, 0},
-				{1, 0, 0},
-				{0, 1, 0},
-				{-1, 0, 0},
-				{0, 0, 0},
-			},
-			facet_restrictions = {{0, 1, 4}, {1, 2, 5}, {2, 3, 6}, {3, 0, 7}},
-			sub_entity_perms = #partial{.Line = {{perm = {0}, sign = {1}}, {perm = {0}, sign = {1}}}},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				x, y := r.x, r.y
-				nm1 :: proc(t: f64) -> f64 { return (t * t - t) / 2.0 }
-				n0 :: proc(t: f64) -> f64 { return 1.0 - t * t }
-				np1 :: proc(t: f64) -> f64 { return (t * t + t) / 2.0 }
-				switch dof {
-				case 0: return nm1(x) * nm1(y)
-				case 1: return np1(x) * nm1(y)
-				case 2: return np1(x) * np1(y)
-				case 3: return nm1(x) * np1(y)
-				case 4: return n0(x) * nm1(y)
-				case 5: return np1(x) * n0(y)
-				case 6: return n0(x) * np1(y)
-				case 7: return nm1(x) * n0(y)
-				case 8: return n0(x) * n0(y)
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				x, y := r.x, r.y
-				nm1 :: proc(t: f64) -> f64 { return (t * t - t) / 2.0 }
-				n0 :: proc(t: f64) -> f64 { return 1.0 - t * t }
-				np1 :: proc(t: f64) -> f64 { return (t * t + t) / 2.0 }
-				dnm1 :: proc(t: f64) -> f64 { return t - 0.5 }
-				dn0 :: proc(t: f64) -> f64 { return -2.0 * t }
-				dnp1 :: proc(t: f64) -> f64 { return t + 0.5 }
-				switch dof {
-				case 0: return {dnm1(x) * nm1(y), nm1(x) * dnm1(y), 0}
-				case 1: return {dnp1(x) * nm1(y), np1(x) * dnm1(y), 0}
-				case 2: return {dnp1(x) * np1(y), np1(x) * dnp1(y), 0}
-				case 3: return {dnm1(x) * np1(y), nm1(x) * dnp1(y), 0}
-				case 4: return {dn0(x) * nm1(y), n0(x) * dnm1(y), 0}
-				case 5: return {dnp1(x) * n0(y), np1(x) * dn0(y), 0}
-				case 6: return {dn0(x) * np1(y), n0(x) * dnp1(y), 0}
-				case 7: return {dnm1(x) * n0(y), nm1(x) * dn0(y), 0}
-				case 8: return {dn0(x) * n0(y), n0(x) * dn0(y), 0}
-				case: unreachable()
-				}
-			},
-		},
-	},
-	rt = #partial{
-		.O0 = {
-			support = {{.D1, 0, 0}, {.D1, 1, 0}, {.D1, 2, 0}, {.D1, 3, 0}},
-			facet_restrictions = {{0}, {1}, {2}, {3}},
-			sub_entity_perms = #partial{.Line = {{perm = {0}, sign = {1}}, {perm = {0}, sign = {-1}}}},
-			vals = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				x, y := r.x, r.y
-				switch dof {
-				case 0: return {0, (y - 1.0) / 4.0, 0}
-				case 1: return {(x + 1.0) / 4.0, 0, 0}
-				case 2: return {0, (y + 1.0) / 4.0, 0}
-				case 3: return {(x - 1.0) / 4.0, 0, 0}
-				case: unreachable()
-				}
-			},
-			divs = proc(dof: int, r: Ref_Vec) -> f64 {
-				switch dof {
-				case 0, 1, 2, 3: return 0.25
-				case: unreachable()
-				}
-			},
-		},
-	},
+// Transform for an entity's dof block at orientation `key`.
+basis_orientation :: proc(bd: Basis_Desc, entity_type: Element_Type, key: u8) -> Orientation_Transform {
+	table := basis_ref(bd).orientations[entity_type]
+	if key == 0 || table == nil { return {} }
+	return table[key]
 }
 
-REF_TET :: Reference_Element {
-	topo = {
-		dim = .D3,
-		facet_types = {.Tri, .Tri, .Tri, .Tri},
-		facet_ref_normals = {{0, 0, -1}, {0, -1, 0}, {-1, 0, 0}, {REC_ROOT_3, REC_ROOT_3, REC_ROOT_3}},
-		sub_entity_verts = #partial{
-			.D0 = {{0}, {1}, {2}, {3}},
-			.D1 = {{0, 1}, {1, 2}, {2, 0}, {0, 3}, {1, 3}, {2, 3}},
-			.D2 = {{0, 2, 1}, {0, 1, 3}, {0, 3, 2}, {1, 2, 3}},
-			.D3 = {{0, 1, 2, 3}},
-		},
-		sub_entity_edges = {{2, 1, 0}, {0, 4, 3}, {3, 5, 2}, {1, 5, 4}},
-		orientation_perms = {},
-	},
-	quad = [Quadrature_Set]Reference_Quadrature {
-		.Q1 = {points = {{0.25, 0.25, 0.25}}, weights = {1.0 / 6.0}},
-		.Q3 = {
-			points = {
-				{0.138196601125011, 0.138196601125011, 0.138196601125011},
-				{0.585410196624968, 0.138196601125011, 0.138196601125011},
-				{0.138196601125011, 0.585410196624968, 0.138196601125011},
-				{0.138196601125011, 0.138196601125011, 0.585410196624968},
-			},
-			weights = {1.0 / 24.0, 1.0 / 24.0, 1.0 / 24.0, 1.0 / 24.0},
-		},
-		.Q5 = {
-			points = {
-				{0.0927352503108912, 0.0927352503108912, 0.0927352503108912},
-				{0.7217942490673264, 0.0927352503108912, 0.0927352503108912},
-				{0.0927352503108912, 0.7217942490673264, 0.0927352503108912},
-				{0.0927352503108912, 0.0927352503108912, 0.7217942490673264},
-				{0.3108859192633006, 0.3108859192633006, 0.3108859192633006},
-				{0.0673422421100982, 0.3108859192633006, 0.3108859192633006},
-				{0.3108859192633006, 0.0673422421100982, 0.3108859192633006},
-				{0.3108859192633006, 0.3108859192633006, 0.0673422421100982},
-				{0.0455037041256495, 0.0455037041256495, 0.4544962958743505},
-				{0.0455037041256495, 0.4544962958743505, 0.0455037041256495},
-				{0.4544962958743505, 0.0455037041256495, 0.0455037041256495},
-				{0.4544962958743505, 0.4544962958743505, 0.0455037041256495},
-				{0.4544962958743505, 0.0455037041256495, 0.4544962958743505},
-				{0.0455037041256495, 0.4544962958743505, 0.4544962958743505},
-			},
-			weights = {
-				0.01224884051939365,
-				0.01224884051939365,
-				0.01224884051939365,
-				0.01224884051939365,
-				0.01878132095300263,
-				0.01878132095300263,
-				0.01878132095300263,
-				0.01878132095300263,
-				0.00709100346284690,
-				0.00709100346284690,
-				0.00709100346284690,
-				0.00709100346284690,
-				0.00709100346284690,
-				0.00709100346284690,
-			},
-		},
-	},
-	lagrange = {
-		.O0 = {
-			support = {{.D3, 0, 0}},
-			nodes = {{0.25, 0.25, 0.25}},
-			facet_restrictions = {{}, {}, {}, {}},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				switch dof {
-				case 0: return 1.0
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				switch dof {
-				case 0: return {0, 0, 0}
-				case: unreachable()
-				}
-			},
-		},
-		.O1 = {
-			support = {{.D0, 0, 0}, {.D0, 1, 0}, {.D0, 2, 0}, {.D0, 3, 0}},
-			nodes = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}},
-			facet_restrictions = {{0, 2, 1}, {0, 1, 3}, {0, 3, 2}, {1, 2, 3}},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				switch dof {
-				case 0: return 1.0 - r.x - r.y - r.z
-				case 1: return r.x
-				case 2: return r.y
-				case 3: return r.z
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				switch dof {
-				case 0: return {-1, -1, -1}
-				case 1: return {1, 0, 0}
-				case 2: return {0, 1, 0}
-				case 3: return {0, 0, 1}
-				case: unreachable()
-				}
-			},
-		},
-		.O2 = {
-			support = {
-				{.D0, 0, 0},
-				{.D0, 1, 0},
-				{.D0, 2, 0},
-				{.D0, 3, 0},
-				{.D1, 0, 0},
-				{.D1, 1, 0},
-				{.D1, 2, 0},
-				{.D1, 3, 0},
-				{.D1, 4, 0},
-				{.D1, 5, 0},
-			},
-			nodes = {
-				{0, 0, 0},
-				{1, 0, 0},
-				{0, 1, 0},
-				{0, 0, 1},
-				{0.5, 0, 0},
-				{0.5, 0.5, 0},
-				{0, 0.5, 0},
-				{0, 0, 0.5},
-				{0.5, 0, 0.5},
-				{0, 0.5, 0.5},
-			},
-			facet_restrictions = {{0, 2, 1, 6, 5, 4}, {0, 1, 3, 4, 8, 7}, {0, 3, 2, 7, 9, 6}, {1, 2, 3, 5, 9, 8}},
-			sub_entity_perms = #partial{.Line = {{perm = {0}, sign = {1}}, {perm = {0}, sign = {1}}}},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				x, y, z := r.x, r.y, r.z
-				l0 := 1.0 - x - y - z
-				switch dof {
-				case 0: return l0 * (2.0 * l0 - 1.0)
-				case 1: return x * (2.0 * x - 1.0)
-				case 2: return y * (2.0 * y - 1.0)
-				case 3: return z * (2.0 * z - 1.0)
-				case 4: return 4.0 * l0 * x
-				case 5: return 4.0 * x * y
-				case 6: return 4.0 * y * l0
-				case 7: return 4.0 * l0 * z
-				case 8: return 4.0 * x * z
-				case 9: return 4.0 * y * z
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				x, y, z := r.x, r.y, r.z
-				switch dof {
-				case 0:
-					v := 4.0 * x + 4.0 * y + 4.0 * z - 3.0; return {v, v, v}
-				case 1: return {4.0 * x - 1.0, 0, 0}
-				case 2: return {0, 4.0 * y - 1.0, 0}
-				case 3: return {0, 0, 4.0 * z - 1.0}
-				case 4: return {4.0 - 8.0 * x - 4.0 * y - 4.0 * z, -4.0 * x, -4.0 * x}
-				case 5: return {4.0 * y, 4.0 * x, 0}
-				case 6: return {-4.0 * y, 4.0 - 4.0 * x - 8.0 * y - 4.0 * z, -4.0 * y}
-				case 7: return {-4.0 * z, -4.0 * z, 4.0 - 4.0 * x - 4.0 * y - 8.0 * z}
-				case 8: return {4.0 * z, 0, 4.0 * x}
-				case 9: return {0, 4.0 * z, 4.0 * y}
-				case: unreachable()
-				}
-			},
-		},
-	},
-	rt = #partial{
-		.O0 = {
-			support = {{.D2, 0, 0}, {.D2, 1, 0}, {.D2, 2, 0}, {.D2, 3, 0}},
-			facet_restrictions = {{0}, {1}, {2}, {3}},
-			sub_entity_perms = #partial{
-				.Tri = {
-					{perm = {0}, sign = {1}},
-					{perm = {0}, sign = {-1}},
-					{perm = {0}, sign = {-1}},
-					{perm = {0}, sign = {1}},
-					{perm = {0}, sign = {1}},
-					{perm = {0}, sign = {-1}},
-				},
-			},
-			vals = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				x, y, z := r.x, r.y, r.z
-				switch dof {
-				case 0: return {2.0 * x, 2.0 * y, 2.0 * z - 2.0}
-				case 1: return {2.0 * x, 2.0 * y - 2.0, 2.0 * z}
-				case 2: return {2.0 * x - 2.0, 2.0 * y, 2.0 * z}
-				case 3: return {2.0 * x, 2.0 * y, 2.0 * z}
-				case: unreachable()
-				}
-			},
-			divs = proc(dof: int, r: Ref_Vec) -> f64 {
-				switch dof {
-				case 0, 1, 2, 3: return 6.0
-				case: unreachable()
-				}
-			},
-		},
-	},
+basis_quantity_map :: proc(bd: Basis_Desc, q: Basis_Quantity) -> Map_Type {
+	assert(q in BASIS_QUANTITIES[bd.family])
+	switch q {
+	case .S_Val: return .Unity
+	case .S_Grd: return .Covariant
+	case .V_Div: return .Density
+	case .V_Val: return bd.family == .Raviart_Thomas ? .Contravariant : .Covariant
+	case .V_Curl: return element_dim(bd.element) == .D3 ? .Contravariant : .Density // 2D curl is a scalar
+	}
+	unreachable()
 }
 
-REF_HEX :: Reference_Element {
-	topo = {
-		dim = .D3,
-		facet_types = {.Quad, .Quad, .Quad, .Quad, .Quad, .Quad},
-		facet_ref_normals = {{0, 0, -1}, {0, 0, +1}, {0, -1, 0}, {0, +1, 0}, {-1, 0, 0}, {+1, 0, 0}},
-		sub_entity_verts = #partial{
-			.D0 = {{0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}},
-			.D1 = {{0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}, {5, 6}, {6, 7}, {7, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}},
-			.D2 = {{0, 3, 2, 1}, {4, 5, 6, 7}, {0, 1, 5, 4}, {3, 7, 6, 2}, {0, 4, 7, 3}, {1, 2, 6, 5}},
-			.D3 = {{0, 1, 2, 3, 4, 5, 6, 7}},
-		},
-		sub_entity_edges = {{2, 1, 0, 3}, {4, 5, 6, 7}, {0, 9, 4, 8}, {11, 6, 10, 2}, {8, 7, 11, 3}, {1, 10, 5, 9}},
-		orientation_perms = {},
-	},
-	quad = [Quadrature_Set]Reference_Quadrature {
-		.Q1 = {points = {{0, 0, 0}}, weights = {8}},
-		.Q3 = {
-			points = {
-				{-REC_ROOT_3, -REC_ROOT_3, -REC_ROOT_3},
-				{REC_ROOT_3, -REC_ROOT_3, -REC_ROOT_3},
-				{REC_ROOT_3, REC_ROOT_3, -REC_ROOT_3},
-				{-REC_ROOT_3, REC_ROOT_3, -REC_ROOT_3},
-				{-REC_ROOT_3, -REC_ROOT_3, REC_ROOT_3},
-				{REC_ROOT_3, -REC_ROOT_3, REC_ROOT_3},
-				{REC_ROOT_3, REC_ROOT_3, REC_ROOT_3},
-				{-REC_ROOT_3, REC_ROOT_3, REC_ROOT_3},
-			},
-			weights = {1, 1, 1, 1, 1, 1, 1, 1},
-		},
-		.Q5 = {
-			points = {
-				{-ROOT_3_5, -ROOT_3_5, -ROOT_3_5},
-				{0., -ROOT_3_5, -ROOT_3_5},
-				{ROOT_3_5, -ROOT_3_5, -ROOT_3_5},
-				{-ROOT_3_5, 0., -ROOT_3_5},
-				{0., 0., -ROOT_3_5},
-				{ROOT_3_5, 0., -ROOT_3_5},
-				{-ROOT_3_5, ROOT_3_5, -ROOT_3_5},
-				{0., ROOT_3_5, -ROOT_3_5},
-				{ROOT_3_5, ROOT_3_5, -ROOT_3_5},
-				{-ROOT_3_5, -ROOT_3_5, 0.},
-				{0., -ROOT_3_5, 0.},
-				{ROOT_3_5, -ROOT_3_5, 0.},
-				{-ROOT_3_5, 0., 0.},
-				{0., 0., 0.},
-				{ROOT_3_5, 0., 0.},
-				{-ROOT_3_5, ROOT_3_5, 0.},
-				{0., ROOT_3_5, 0.},
-				{ROOT_3_5, ROOT_3_5, 0.},
-				{-ROOT_3_5, -ROOT_3_5, ROOT_3_5},
-				{0., -ROOT_3_5, ROOT_3_5},
-				{ROOT_3_5, -ROOT_3_5, ROOT_3_5},
-				{-ROOT_3_5, 0., ROOT_3_5},
-				{0., 0., ROOT_3_5},
-				{ROOT_3_5, 0., ROOT_3_5},
-				{-ROOT_3_5, ROOT_3_5, ROOT_3_5},
-				{0., ROOT_3_5, ROOT_3_5},
-				{ROOT_3_5, ROOT_3_5, ROOT_3_5},
-			},
-			weights = {
-				0.17146776,
-				0.27469136,
-				0.17146776,
-				0.27469136,
-				0.43209877,
-				0.27469136,
-				0.17146776,
-				0.27469136,
-				0.17146776,
-				0.27469136,
-				0.43209877,
-				0.27469136,
-				0.43209877,
-				0.68659221,
-				0.43209877,
-				0.27469136,
-				0.43209877,
-				0.27469136,
-				0.17146776,
-				0.27469136,
-				0.17146776,
-				0.27469136,
-				0.43209877,
-				0.27469136,
-				0.17146776,
-				0.27469136,
-				0.17146776,
-			},
-		},
-	},
-	lagrange = {
-		.O0 = {
-			support = {{.D3, 0, 0}},
-			nodes = {{0, 0, 0}},
-			facet_restrictions = {{}, {}, {}, {}, {}, {}},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				switch dof {
-				case 0: return 1.0
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				switch dof {
-				case 0: return {0, 0, 0}
-				case: unreachable()
-				}
-			},
-		},
-		.O1 = {
-			support = {
-				{.D0, 0, 0},
-				{.D0, 1, 0},
-				{.D0, 2, 0},
-				{.D0, 3, 0},
-				{.D0, 4, 0},
-				{.D0, 5, 0},
-				{.D0, 6, 0},
-				{.D0, 7, 0},
-			},
-			nodes = {
-				{-1, -1, -1},
-				{1, -1, -1},
-				{1, 1, -1},
-				{-1, 1, -1},
-				{-1, -1, 1},
-				{1, -1, 1},
-				{1, 1, 1},
-				{-1, 1, 1},
-			},
-			facet_restrictions = {{0, 3, 2, 1}, {4, 5, 6, 7}, {0, 1, 5, 4}, {3, 7, 6, 2}, {0, 4, 7, 3}, {1, 2, 6, 5}},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				x, y, z := r.x, r.y, r.z
-				switch dof {
-				case 0: return (1.0 - x) * (1.0 - y) * (1.0 - z) / 8.0
-				case 1: return (1.0 + x) * (1.0 - y) * (1.0 - z) / 8.0
-				case 2: return (1.0 + x) * (1.0 + y) * (1.0 - z) / 8.0
-				case 3: return (1.0 - x) * (1.0 + y) * (1.0 - z) / 8.0
-				case 4: return (1.0 - x) * (1.0 - y) * (1.0 + z) / 8.0
-				case 5: return (1.0 + x) * (1.0 - y) * (1.0 + z) / 8.0
-				case 6: return (1.0 + x) * (1.0 + y) * (1.0 + z) / 8.0
-				case 7: return (1.0 - x) * (1.0 + y) * (1.0 + z) / 8.0
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				x, y, z := r.x, r.y, r.z
-				switch dof {
-				case 0:
-					return {-(1.0 - y) * (1.0 - z) / 8.0, -(1.0 - x) * (1.0 - z) / 8.0, -(1.0 - x) * (1.0 - y) / 8.0}
-				case 1:
-					return {(1.0 - y) * (1.0 - z) / 8.0, -(1.0 + x) * (1.0 - z) / 8.0, -(1.0 + x) * (1.0 - y) / 8.0}
-				case 2: return {(1.0 + y) * (1.0 - z) / 8.0, (1.0 + x) * (1.0 - z) / 8.0, -(1.0 + x) * (1.0 + y) / 8.0}
-				case 3:
-					return {-(1.0 + y) * (1.0 - z) / 8.0, (1.0 - x) * (1.0 - z) / 8.0, -(1.0 - x) * (1.0 + y) / 8.0}
-				case 4:
-					return {-(1.0 - y) * (1.0 + z) / 8.0, -(1.0 - x) * (1.0 + z) / 8.0, (1.0 - x) * (1.0 - y) / 8.0}
-				case 5: return {(1.0 - y) * (1.0 + z) / 8.0, -(1.0 + x) * (1.0 + z) / 8.0, (1.0 + x) * (1.0 - y) / 8.0}
-				case 6: return {(1.0 + y) * (1.0 + z) / 8.0, (1.0 + x) * (1.0 + z) / 8.0, (1.0 + x) * (1.0 + y) / 8.0}
-				case 7: return {-(1.0 + y) * (1.0 + z) / 8.0, (1.0 - x) * (1.0 + z) / 8.0, (1.0 - x) * (1.0 + y) / 8.0}
-				case: unreachable()
-				}
-			},
-		},
-		.O2 = {
-			support = {
-				{.D0, 0, 0},
-				{.D0, 1, 0},
-				{.D0, 2, 0},
-				{.D0, 3, 0},
-				{.D0, 4, 0},
-				{.D0, 5, 0},
-				{.D0, 6, 0},
-				{.D0, 7, 0},
-				{.D1, 0, 0},
-				{.D1, 1, 0},
-				{.D1, 2, 0},
-				{.D1, 3, 0},
-				{.D1, 4, 0},
-				{.D1, 5, 0},
-				{.D1, 6, 0},
-				{.D1, 7, 0},
-				{.D1, 8, 0},
-				{.D1, 9, 0},
-				{.D1, 10, 0},
-				{.D1, 11, 0},
-				{.D2, 0, 0},
-				{.D2, 1, 0},
-				{.D2, 2, 0},
-				{.D2, 3, 0},
-				{.D2, 4, 0},
-				{.D2, 5, 0},
-				{.D3, 0, 0},
-			},
-			nodes = {
-				{-1, -1, -1},
-				{1, -1, -1},
-				{1, 1, -1},
-				{-1, 1, -1},
-				{-1, -1, 1},
-				{1, -1, 1},
-				{1, 1, 1},
-				{-1, 1, 1},
-				{0, -1, -1},
-				{1, 0, -1},
-				{0, 1, -1},
-				{-1, 0, -1},
-				{0, -1, 1},
-				{1, 0, 1},
-				{0, 1, 1},
-				{-1, 0, 1},
-				{-1, -1, 0},
-				{1, -1, 0},
-				{1, 1, 0},
-				{-1, 1, 0},
-				{0, 0, -1},
-				{0, 0, 1},
-				{0, -1, 0},
-				{0, 1, 0},
-				{-1, 0, 0},
-				{1, 0, 0},
-				{0, 0, 0},
-			},
-			facet_restrictions = {
-				{0, 3, 2, 1, 10, 9, 8, 11, 20},
-				{4, 5, 6, 7, 12, 13, 14, 15, 21},
-				{0, 1, 5, 4, 8, 17, 12, 16, 22},
-				{3, 7, 6, 2, 10, 18, 14, 19, 23},
-				{0, 4, 7, 3, 16, 15, 19, 11, 24},
-				{1, 2, 6, 5, 9, 18, 13, 17, 25},
-			},
-			sub_entity_perms = #partial{
-				.Line = {{perm = {0}, sign = {1}}, {perm = {0}, sign = {1}}},
-				.Quad = {
-					{perm = {0}, sign = {1}},
-					{perm = {0}, sign = {1}},
-					{perm = {0}, sign = {1}},
-					{perm = {0}, sign = {1}},
-					{perm = {0}, sign = {1}},
-					{perm = {0}, sign = {1}},
-					{perm = {0}, sign = {1}},
-					{perm = {0}, sign = {1}},
-				},
-			},
-			vals = proc(dof: int, r: Ref_Vec) -> f64 {
-				x, y, z := r.x, r.y, r.z
-				nm1 :: proc(t: f64) -> f64 { return (t * t - t) / 2.0 }
-				n0 :: proc(t: f64) -> f64 { return 1.0 - t * t }
-				np1 :: proc(t: f64) -> f64 { return (t * t + t) / 2.0 }
-				switch dof {
-				case 0: return nm1(x) * nm1(y) * nm1(z)
-				case 1: return np1(x) * nm1(y) * nm1(z)
-				case 2: return np1(x) * np1(y) * nm1(z)
-				case 3: return nm1(x) * np1(y) * nm1(z)
-				case 4: return nm1(x) * nm1(y) * np1(z)
-				case 5: return np1(x) * nm1(y) * np1(z)
-				case 6: return np1(x) * np1(y) * np1(z)
-				case 7: return nm1(x) * np1(y) * np1(z)
-				case 8: return n0(x) * nm1(y) * nm1(z)
-				case 9: return np1(x) * n0(y) * nm1(z)
-				case 10: return n0(x) * np1(y) * nm1(z)
-				case 11: return nm1(x) * n0(y) * nm1(z)
-				case 12: return n0(x) * nm1(y) * np1(z)
-				case 13: return np1(x) * n0(y) * np1(z)
-				case 14: return n0(x) * np1(y) * np1(z)
-				case 15: return nm1(x) * n0(y) * np1(z)
-				case 16: return nm1(x) * nm1(y) * n0(z)
-				case 17: return np1(x) * nm1(y) * n0(z)
-				case 18: return np1(x) * np1(y) * n0(z)
-				case 19: return nm1(x) * np1(y) * n0(z)
-				case 20: return n0(x) * n0(y) * nm1(z)
-				case 21: return n0(x) * n0(y) * np1(z)
-				case 22: return n0(x) * nm1(y) * n0(z)
-				case 23: return n0(x) * np1(y) * n0(z)
-				case 24: return nm1(x) * n0(y) * n0(z)
-				case 25: return np1(x) * n0(y) * n0(z)
-				case 26: return n0(x) * n0(y) * n0(z)
-				case: unreachable()
-				}
-			},
-			grads = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				x, y, z := r.x, r.y, r.z
-				nm1 :: proc(t: f64) -> f64 { return (t * t - t) / 2.0 }
-				n0 :: proc(t: f64) -> f64 { return 1.0 - t * t }
-				np1 :: proc(t: f64) -> f64 { return (t * t + t) / 2.0 }
-				dnm1 :: proc(t: f64) -> f64 { return t - 0.5 }
-				dn0 :: proc(t: f64) -> f64 { return -2.0 * t }
-				dnp1 :: proc(t: f64) -> f64 { return t + 0.5 }
-				switch dof {
-				case 0: return {dnm1(x) * nm1(y) * nm1(z), nm1(x) * dnm1(y) * nm1(z), nm1(x) * nm1(y) * dnm1(z)}
-				case 1: return {dnp1(x) * nm1(y) * nm1(z), np1(x) * dnm1(y) * nm1(z), np1(x) * nm1(y) * dnm1(z)}
-				case 2: return {dnp1(x) * np1(y) * nm1(z), np1(x) * dnp1(y) * nm1(z), np1(x) * np1(y) * dnm1(z)}
-				case 3: return {dnm1(x) * np1(y) * nm1(z), nm1(x) * dnp1(y) * nm1(z), nm1(x) * np1(y) * dnm1(z)}
-				case 4: return {dnm1(x) * nm1(y) * np1(z), nm1(x) * dnm1(y) * np1(z), nm1(x) * nm1(y) * dnp1(z)}
-				case 5: return {dnp1(x) * nm1(y) * np1(z), np1(x) * dnm1(y) * np1(z), np1(x) * nm1(y) * dnp1(z)}
-				case 6: return {dnp1(x) * np1(y) * np1(z), np1(x) * dnp1(y) * np1(z), np1(x) * np1(y) * dnp1(z)}
-				case 7: return {dnm1(x) * np1(y) * np1(z), nm1(x) * dnp1(y) * np1(z), nm1(x) * np1(y) * dnp1(z)}
-				case 8: return {dn0(x) * nm1(y) * nm1(z), n0(x) * dnm1(y) * nm1(z), n0(x) * nm1(y) * dnm1(z)}
-				case 9: return {dnp1(x) * n0(y) * nm1(z), np1(x) * dn0(y) * nm1(z), np1(x) * n0(y) * dnm1(z)}
-				case 10: return {dn0(x) * np1(y) * nm1(z), n0(x) * dnp1(y) * nm1(z), n0(x) * np1(y) * dnm1(z)}
-				case 11: return {dnm1(x) * n0(y) * nm1(z), nm1(x) * dn0(y) * nm1(z), nm1(x) * n0(y) * dnm1(z)}
-				case 12: return {dn0(x) * nm1(y) * np1(z), n0(x) * dnm1(y) * np1(z), n0(x) * nm1(y) * dnp1(z)}
-				case 13: return {dnp1(x) * n0(y) * np1(z), np1(x) * dn0(y) * np1(z), np1(x) * n0(y) * dnp1(z)}
-				case 14: return {dn0(x) * np1(y) * np1(z), n0(x) * dnp1(y) * np1(z), n0(x) * np1(y) * dnp1(z)}
-				case 15: return {dnm1(x) * n0(y) * np1(z), nm1(x) * dn0(y) * np1(z), nm1(x) * n0(y) * dnp1(z)}
-				case 16: return {dnm1(x) * nm1(y) * n0(z), nm1(x) * dnm1(y) * n0(z), nm1(x) * nm1(y) * dn0(z)}
-				case 17: return {dnp1(x) * nm1(y) * n0(z), np1(x) * dnm1(y) * n0(z), np1(x) * nm1(y) * dn0(z)}
-				case 18: return {dnp1(x) * np1(y) * n0(z), np1(x) * dnp1(y) * n0(z), np1(x) * np1(y) * dn0(z)}
-				case 19: return {dnm1(x) * np1(y) * n0(z), nm1(x) * dnp1(y) * n0(z), nm1(x) * np1(y) * dn0(z)}
-				case 20: return {dn0(x) * n0(y) * nm1(z), n0(x) * dn0(y) * nm1(z), n0(x) * n0(y) * dnm1(z)}
-				case 21: return {dn0(x) * n0(y) * np1(z), n0(x) * dn0(y) * np1(z), n0(x) * n0(y) * dnp1(z)}
-				case 22: return {dn0(x) * nm1(y) * n0(z), n0(x) * dnm1(y) * n0(z), n0(x) * nm1(y) * dn0(z)}
-				case 23: return {dn0(x) * np1(y) * n0(z), n0(x) * dnp1(y) * n0(z), n0(x) * np1(y) * dn0(z)}
-				case 24: return {dnm1(x) * n0(y) * n0(z), nm1(x) * dn0(y) * n0(z), nm1(x) * n0(y) * dn0(z)}
-				case 25: return {dnp1(x) * n0(y) * n0(z), np1(x) * dn0(y) * n0(z), np1(x) * n0(y) * dn0(z)}
-				case 26: return {dn0(x) * n0(y) * n0(z), n0(x) * dn0(y) * n0(z), n0(x) * n0(y) * dn0(z)}
-				case: unreachable()
-				}
-			},
-		},
-	},
-	rt = #partial{
-		.O0 = {
-			support = {{.D2, 0, 0}, {.D2, 1, 0}, {.D2, 2, 0}, {.D2, 3, 0}, {.D2, 4, 0}, {.D2, 5, 0}},
-			facet_restrictions = {{0}, {1}, {2}, {3}, {4}, {5}},
-			sub_entity_perms = #partial{
-				.Quad = {
-					{perm = {0}, sign = {1}},
-					{perm = {0}, sign = {1}},
-					{perm = {0}, sign = {1}},
-					{perm = {0}, sign = {1}},
-					{perm = {0}, sign = {-1}},
-					{perm = {0}, sign = {-1}},
-					{perm = {0}, sign = {-1}},
-					{perm = {0}, sign = {-1}},
-				},
-			},
-			vals = proc(dof: int, r: Ref_Vec) -> Ref_Vec {
-				x, y, z := r.x, r.y, r.z
-				switch dof {
-				case 0: return {0, 0, (z - 1.0) / 8.0}
-				case 1: return {0, 0, (z + 1.0) / 8.0}
-				case 2: return {0, (y - 1.0) / 8.0, 0}
-				case 3: return {0, (y + 1.0) / 8.0, 0}
-				case 4: return {(x - 1.0) / 8.0, 0, 0}
-				case 5: return {(x + 1.0) / 8.0, 0, 0}
-				case: unreachable()
-				}
-			},
-			divs = proc(dof: int, r: Ref_Vec) -> f64 {
-				switch dof {
-				case 0, 1, 2, 3, 4, 5: return 0.125
-				case: unreachable()
-				}
-			},
-		},
-	},
+// Highest polynomial degree in the space (per direction on quads/hexes).
+@(rodata, private = "file")
+FAMILY_DEGREE_OFFSET := [Basis_Family]int {
+	.Lagrange       = 0,
+	.Raviart_Thomas = 1,
+	.Nedelec        = 1,
+}
+
+// Smallest quadrature set that integrates a product of two functions of the basis exactly (a mass matrix),
+// plus `extra` degrees for coefficients, geometry or the other operand.
+basis_quad_rule :: proc(bd: Basis_Desc, extra := 0) -> (Rule, []f64) {
+	need := 2 * (int(bd.order) + FAMILY_DEGREE_OFFSET[bd.family]) + extra
+	for set in Quadrature_Set {
+		if QUAD_SET_DEGREE[set] >= need { return element_quadrature_rule(bd.element, set) }
+	}
+	panic("no quadrature set is exact enough; raise extra's source or add a higher set")
+}
+
+basis_facet_quad_rule :: proc(bd: Basis_Desc, facet: int, extra := 0) -> (Rule, []f64) {
+	need := 2 * (int(bd.order) + FAMILY_DEGREE_OFFSET[bd.family]) + extra
+	facet := element_facet(bd.element, facet)
+	for set in Quadrature_Set {
+		if QUAD_SET_DEGREE[set] >= need { return element_quadrature_rule(facet.type, set) }
+	}
+	panic("no quadrature set is exact enough; raise extra's source or add a higher set")
+}
+
+@(private = "file")
+basis_ref :: proc(bd: Basis_Desc) -> ^Reference_Basis {
+	return &REFERENCE_ELEMENTS[bd.element].bases[bd.family][bd.order]
 }

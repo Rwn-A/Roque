@@ -1,9 +1,5 @@
 package fe
 
-/*
- Finite element space. Global discrete function space a quantity is discretized over.
-*/
-
 import "core:mem"
 import "core:mem/virtual"
 import "core:slice"
@@ -15,11 +11,9 @@ Space_Continuity :: enum {
 	Discontinuous,
 }
 
-// .Cell is the usual case
-// .Facet is for trace spaces, numbered directly over facets one dimension down.
 Numbered_Entity :: enum {
-	Cell,
-	Facet,
+	Cell, // cell is usual case
+	Facet, // for trace spaces
 }
 
 Space_Desc :: struct #all_or_none {
@@ -29,19 +23,18 @@ Space_Desc :: struct #all_or_none {
 	regions:    Region_Set,
 }
 
+// Local to global DOF numbering for a finite element space, same for all `fields` on the space.
 DOF_Numbering :: struct {
 	l2g:           [][]i32,
-	flip_sign:     [][]bool,
 	num_dofs:      int,
 	numbered_over: Dimension,
 }
 
-Space_ID :: distinct int
-
+// Finite element space
 Space :: struct {
 	using sd:       Space_Desc,
+	mesh:           ^Mesh,
 	fields:         int,
-	id:             Space_ID, // automatically assigned, for identifying spaces in a multi space.
 	total_coeffs:   int,
 	numbering:      DOF_Numbering,
 	owns_numbering: bool,
@@ -53,11 +46,9 @@ Space_Vector :: struct {
 	coeffs:      []f64, // len space.total_coeffs
 }
 
-@(thread_local, private)
-next_id: Space_ID
-
+// New FE space over the mesh
 space_new :: proc(
-	mesh: Mesh,
+	mesh: ^Mesh,
 	sd: Space_Desc,
 	fields: int,
 	nent := Numbered_Entity.Cell,
@@ -65,186 +56,95 @@ space_new :: proc(
 ) -> ^Space {
 	assert(fields <= MAX_FIELDS)
 
-	s := new(Space, alloc)
+	on_cells := nent == .Cell
+	n_elems := len(mesh.cells) if on_cells else len(mesh.facets)
 
-	s^ = {
-		sd             = sd,
-		fields         = fields,
-		owns_numbering = true,
-		id             = next_id,
-		allocator      = alloc,
-	}
-	next_id += 1
-
-	context.allocator = alloc
 	scratch_guard()
 
-	// building dof numbering
-
-	DOF_Key :: struct {
-		id:        Entity_ID,
-		local_dof: int, // local dof on that entity
+	start: [Dimension][]i32
+	for d in Dimension {
+		start[d] = make([]i32, mesh.n_entities[d], scratch())
+		slice.fill(start[d], -1)
 	}
 
-	Numbering_Conn :: struct {
-		conn:              Cell_Conn,
-		edge_orientations: [MAX_EDGES]u8,
-		face_orientations: [MAX_FACES]u8,
-	}
+	l2g := make([][]i32, n_elems, alloc)
+	next: i32
 
-	n: DOF_Numbering = {
-		numbered_over = mesh.intrinsic_dim if nent == .Cell else Dimension(int(mesh.intrinsic_dim) - 1),
-	}
-	s.numbering = n
+	for &row, i in l2g {
+		elem := Entity_ID(i)
+		et: Element_Type
+		conn: Connectivity
 
-	next_global: int
-	shared_maps := [Dimension]map[DOF_Key]int{}
-	for &m in shared_maps { m = make(map[DOF_Key]int, scratch()) }
-
-	switch nent {
-	case .Cell:
-		n.l2g = make([][]i32, len(mesh.cells))
-		n.flip_sign = make([][]bool, len(mesh.cells))
-		for cell in mesh.cells {
-			if cell.region not_in sd.regions { continue }
-			bd := space_bd(s, cell.type)
-			n.l2g[cell.id] = make([]i32, basis_count(bd))
-			n.flip_sign[cell.id] = make([]bool, basis_count(bd))
-			conn := Numbering_Conn{mesh.cell_conn[cell.id], cell.edge_orientation, cell.face_orientation}
-			number_dofs(&shared_maps, &next_global, bd, sd.continuity, n.l2g[cell.id], n.flip_sign[cell.id], conn)
+		if on_cells {
+			if mesh.cells[elem].region not_in sd.regions { continue }
+			et, conn = mesh.cells[elem].type, mesh.cell_conn[elem]
+		} else {
+			if facet_regions(mesh^, mesh.facets[elem]) & sd.regions == {} { continue }
+			et, conn = mesh.facets[elem].info.type, facet_connectivity(mesh^, elem, scratch())
 		}
-	case .Facet:
-		n.l2g = make([][]i32, len(mesh.facets))
-		n.flip_sign = make([][]bool, len(mesh.facets))
-		for facet in mesh.facets {
-			if facet_regions(mesh, facet) & sd.regions == {} { continue }
-			bd := space_bd(s, facet.info.type)
-			n.l2g[facet.id] = make([]i32, basis_count(bd))
-			n.flip_sign[facet.id] = make([]bool, basis_count(bd))
 
-			cell, local_facet := facet_canonical_cell(mesh, facet)
-			cell_conn := mesh.cell_conn[cell.id]
-
-			// temporary facet connectivity
-			verts: [MAX_VERTICES]Entity_ID
-			edges: [MAX_EDGES]Entity_ID
-			edge_orientations: [MAX_EDGES]u8
-			// faces are always interior for trace space so we can ignore face orientation
-
-			if mesh.intrinsic_dim == .D3 {
-				for edge, i in element_facet_edges(cell.type, local_facet) {
-					edge_orientations[i] = cell.edge_orientation[edge]
-					edges[i] = cell_conn.edges[edge]
+		bd := Basis_Desc{et, sd.family, sd.order}
+		row = make([]i32, basis_num_dofs(bd), alloc)
+		ls := 0
+		for d in Dimension {
+			count := basis_dofs_per_entity(bd, d)
+			if count == 0 { continue }
+			for gid in conn[d] {
+				if sd.continuity == .Discontinuous || start[d][gid] < 0 {
+					start[d][gid] = next
+					next += i32(count)
 				}
+				for j in 0 ..< count { row[ls + j] = start[d][gid] + i32(j) }
+				ls += count
 			}
-
-			for vert, i in element_facet_verts(cell.type, local_facet) {
-				verts[i] = cell_conn.vertices[vert]
-			}
-
-			conn := Numbering_Conn {
-				conn = {vertices = verts[:], edges = edges[:]},
-				edge_orientations = edge_orientations,
-			}
-
-			// face is always internal to a trace space, (unless we go to 4d), so orientation doesnt matter.
-			number_dofs(&shared_maps, &next_global, bd, sd.continuity, n.l2g[facet.id], n.flip_sign[facet.id], conn)
 		}
-	case: unreachable()
 	}
 
-	s.numbering = n
-	s.numbering.num_dofs = next_global
-	s.total_coeffs = s.numbering.num_dofs * s.fields
-
+	s := new(Space, alloc)
+	s^ = {
+		sd = sd,
+		mesh = mesh,
+		fields = fields,
+		total_coeffs = int(next) * fields,
+		numbering = {
+			l2g = l2g,
+			num_dofs = int(next),
+			numbered_over = mesh.intrinsic_dim if on_cells else mesh.intrinsic_dim - Dimension(1),
+		},
+		owns_numbering = true,
+		allocator = alloc,
+	}
 	return s
-
-	number_dofs :: proc(
-		shared: ^[Dimension]map[DOF_Key]int,
-		next_global: ^int,
-		bd: Basis_Desc,
-		continuity: Space_Continuity,
-		l2g: []i32,
-		signs: []bool,
-		conn: Numbering_Conn,
-	) {
-		for sup, dof in basis_support(bd) {
-			if continuity == .Discontinuous {
-				l2g[dof] = i32(next_global^)
-				signs[dof] = false
-				next_global^ += 1
-				continue
-			}
-			switch sup.entity_dim {
-			case element_dim(bd.element):
-				//internal no sharing
-				l2g[dof] = i32(next_global^)
-				signs[dof] = false
-				next_global^ += 1
-			case .D0:
-				key := DOF_Key{conn.conn.vertices[sup.entity_index], sup.entity_dof_index}
-				l2g[dof] = assign_shared_dof(&shared[.D0], key, next_global)
-				signs[dof] = false
-			case .D1, .D2:
-				ft := Element_Type.Line if sup.entity_dim == .D1 else element_facet_type(bd.element, sup.entity_index)
-				orientation :=
-					conn.edge_orientations[sup.entity_index] if sup.entity_dim == .D1 else conn.face_orientations[sup.entity_index]
-				ent :=
-					conn.conn.edges[sup.entity_index] if sup.entity_dim == .D1 else conn.conn.faces[sup.entity_index]
-				dof_local, flip := basis_orient_dof(bd, ft, orientation, sup.entity_dof_index)
-				key := DOF_Key{ent, dof_local}
-				l2g[dof] = assign_shared_dof(&shared[sup.entity_dim], key, next_global)
-				signs[dof] = flip
-			case .D3: unreachable()
-			}
-		}
-	}
-
-	assign_shared_dof :: proc(m: ^map[DOF_Key]int, key: DOF_Key, next_global: ^int) -> i32 {
-		if existing, ok := m[key]; ok { return i32(existing) }
-		v := next_global^
-		m[key] = v
-		next_global^ += 1
-		return i32(v)
-	}
-
 }
 
+// Create a new space with the same numbering as the existing space
 space_from_existing :: proc(existing: Space, fields: int, alloc := context.allocator) -> ^Space {
 	assert(fields <= MAX_FIELDS)
 
 	s := new(Space, alloc)
-
-	s^ = {
-		numbering      = existing.numbering,
-		sd             = existing.sd,
-		fields         = fields,
-		total_coeffs   = existing.numbering.num_dofs * fields,
-		owns_numbering = false,
-		id             = next_id,
-		allocator      = alloc,
-	}
-	next_id += 1
+	s^ = existing
+	s.fields = fields
+	s.total_coeffs = existing.numbering.num_dofs * fields
+	s.owns_numbering = false
+	s.allocator = alloc
 
 	return s
-
 }
 
-space_new_isoparemetric :: proc(mesh: Mesh, fields: int, alloc := context.allocator) -> ^Space {
+// Create a new space isoparemtric with the mesh geometry.
+space_new_isoparemetric :: proc(mesh: ^Mesh, fields: int, alloc := context.allocator) -> ^Space {
 	assert(fields <= MAX_FIELDS)
 
 	s := new(Space, alloc)
 	s^ = {
+		sd = {.Lagrange, mesh.order, .Continuous, ALL_REGIONS},
+		mesh = mesh,
 		numbering = {l2g = mesh.cell_nodes, num_dofs = len(mesh.nodes), numbered_over = mesh.intrinsic_dim},
 		fields = fields,
 		total_coeffs = len(mesh.nodes) * fields,
-		id = next_id,
-		allocator = alloc,
 		owns_numbering = false,
-		sd = {.Lagrange, mesh.order, .Continuous, ALL_REGIONS}
+		allocator = alloc,
 	}
-
-	next_id += 1
 
 	return s
 }
@@ -254,229 +154,198 @@ space_destroy :: proc(spaces: ..^Space) {
 	for s in spaces {
 		context.allocator = s.allocator
 		if s.owns_numbering {
-			for entity in 0 ..< len(s.numbering.l2g) {
-				delete(s.numbering.l2g[entity])
-				if s.numbering.flip_sign != nil { delete(s.numbering.flip_sign[entity]) }
-			}
+			for row in s.numbering.l2g { delete(row) }
 			delete(s.numbering.l2g)
-			delete(s.numbering.flip_sign)
 		}
-		free(s) //frees the ptr
+		free(s)
 	}
 }
 
+// Local basis descriptor for the space
 space_bd :: proc(s: ^Space, et: Element_Type) -> Basis_Desc {
 	assert(s.numbering.numbered_over == element_dim(et), "Space is not defined on the element dim.")
 	return {et, s.family, s.order}
 }
 
-space_l2g :: proc(s: ^Space, ent: Entity_ID) -> []i32 {
-	l2g := s.numbering.l2g[ent]
-	assert(l2g != nil, "Space may not be defined on entity")
-	return l2g
-}
 
-@(private)
-space_dof_sign :: proc(s: ^Space, ent: Entity_ID, ldof: int) -> f64 {
-	return -1.0 if s.numbering.flip_sign != nil && s.numbering.flip_sign[ent][ldof] else 1.0
-}
-
-
-// Global dof indices of all dofs that are non-zero on the facet.
-space_facet_dofs :: proc(mesh: Mesh, space: ^Space, facet_id: Entity_ID, alloc := context.allocator) -> []i32 {
-	facet := mesh.facets[facet_id]
-
-	if space.numbering.numbered_over == element_dim(facet.info.type) { return space_l2g(space, facet_id) }
-
-	cell, local_facet := facet_canonical_cell(mesh, facet)
-	restriction := basis_facet_restriction(space_bd(space, cell.type), local_facet)
-	l2g := space_l2g(space, cell.id)
-	out := make([]i32, len(restriction), alloc)
-	for ldof, i in restriction { out[i] = l2g[ldof] }
-
-	return out
-}
-
-space_cvec :: proc($T: typeid, space: ^Space, et: Element_Type, alloc := context.allocator) -> Cvec(T) {
-	return cvec_create(T, basis_count(space_bd(space, et)), space.fields)
-}
-
-space_cmat :: proc(
-	$T: typeid,
-	test, trial: ^Space,
-	test_e, trial_e: Element_Type,
-	alloc := context.allocator,
-) -> Cmat(T) {
-	return cmat_create(
-		T,
-		basis_count(space_bd(test, test_e)),
-		basis_count(space_bd(trial, trial_e)),
-		test.fields,
-		trial.fields,
-	)
-}
-
-// Gather all dofs at this entity, casting to type T for mixed-percision.
-space_gather :: proc($T: typeid, s: Space_Vector, ent: Entity_ID, alloc := context.allocator) -> Cvec(T) {
-	l2g := space_l2g(s, ent)
-	cvec := cvec_create(T, len(l2g), s.fields, alloc)
-
-	for gdof, ldof in l2g {
-		cvb := cvec_dof_block(cvec, ldof)
-		sign := space_dof_sign(s, ent, ldof)
-		for entry, i in s.coeffs[gdof * i32(s.fields):][:s.fields] { cvb[i] = cast(T)entry * cast(T)sign }
+// Gather all dofs of the element, casting to T for mixed precision.
+space_gather :: proc($T: typeid, s: Space_Vector, elem: Entity_ID, alloc := context.allocator) -> Cvec(T) {
+	f := s.fields
+	l2g := s.numbering.l2g[elem]
+	assert(l2g != nil, "element is not in the space")
+	cvec := cvec_create(T, len(l2g), f, alloc)
+	for g, ldof in l2g {
+		dst := cvec.data[ldof * f:][:f]
+		for x, k in s.coeffs[int(g) * f:][:f] { dst[k] = cast(T)x }
 	}
-
 	return cvec
 }
 
-
-// Scatter local into coeffs, casting to type T for mixed-percision.
-space_scatter :: proc(s: Space_Vector, ent: Entity_ID, local: Cvec($T)) {
-	l2g := space_l2g(s, ent)
-
-	assert(len(l2g) * s.fields == len(local.data))
-
-	for gdof, ldof in l2g {
-		cvb := cvec_dof_block(local, ldof)
-		sign := space_dof_sign(s, ent, ldof)
-		for &entry, i in s.coeffs[gdof * i32(s.fields):][:s.fields] { entry = cast(f64)cvb[i] * sign }
+// Scatter local into coeffs, casting to f64.
+space_scatter :: proc(s: Space_Vector, elem: Entity_ID, local: Cvec($T)) {
+	f := s.fields
+	l2g := s.numbering.l2g[elem]
+	assert(l2g != nil, "element is not in the space")
+	assert(len(l2g) * f == len(local.data))
+	for g, ldof in l2g {
+		src := local.data[ldof * f:][:f]
+		for &x, k in s.coeffs[int(g) * f:][:f] { x = cast(f64)src[k] }
 	}
 }
 
-// Scatter only the dofs in Cvec that are in the mask. Cvec must still be sized the same as `scatter`.
-space_scatter_masked :: proc(s: Space_Vector, ent: Entity_ID, local: Cvec($T), mask: []int) {
-	l2g := space_l2g(s, ent)
-
-	assert(len(l2g) * s.fields == len(local.data))
-
-	for ldof, _ in mask {
-		gdof := l2g[ldof]
-		cvb := cvec_dof_block(local, ldof)
-		sign := space_dof_sign(s, ent, ldof)
-		for &entry, i in s.coeffs[gdof * i32(s.fields):][:s.fields] { entry = cast(f64)cvb[i] * sign }
+// Like space_scatter, but only the dofs on `entity`'s closure `local` is still sized for the whole element.
+space_scatter_closure :: proc(s: Space_Vector, elem: Entity_ID, entity: Sub_Entity, local: Cvec($T)) {
+	f := s.fields
+	bd := space_bd(s.space, element_type(s.space, elem))
+	scratch_guard()
+	for ldof in basis_closure_dofs(bd, entity, scratch()) {
+		g := int(s.numbering.l2g[elem][ldof])
+		src := local.data[ldof * f:][:f]
+		for &x, k in s.coeffs[g * f:][:f] { x = cast(f64)src[k] }
 	}
 }
 
-//== Interpolator
-
-Interpolator :: struct($A, $I: int) {
-	geometry, space:            Space_Vector,
-	restriction:                []int,
-	num_dofs:                   int, // actual dofs to visit, accounts for restriction
-	ent:                        Entity_ID,
-	et:                         Element_Type,
-	vals:                       Cvec(f64),
-	current_dof, current_point: int,
-	jacobians:                  Pvec(f64),
-	phys_points:                Pvec(f64),
-	temp:                       Scratch_Temp,
+// Global dof indices of all dofs that are non-zero on the facet.
+space_facet_dofs :: proc(s: ^Space, facet_id: Entity_ID, alloc := context.allocator) -> []i32 {
+	if s.numbering.numbered_over != s.mesh.intrinsic_dim {
+		return slice.clone(s.numbering.l2g[facet_id], alloc) // trace space: the facet is the element, all its dofs
+	}
+	cell, local_facet := facet_canonical_cell(s.mesh^, s.mesh.facets[facet_id])
+	local := basis_closure_dofs(space_bd(s, cell.type), element_facet(cell.type, local_facet).entity, alloc)
+	out := make([]i32, len(local), alloc)
+	for ldof, i in local { out[i] = s.numbering.l2g[cell.id][ldof] }
+	return out
 }
 
-// Interpolate a continous function onto the given FE space, with optional restriction for setting boundary dofs.
-// For convienence, some geometry is computed including the physical point location and jacobian mapping.
-// - A is the ambient dimension this must be equal to the number of coordinates per node in the geo space.
-// - I is the intrinsic dimension and must be equal to dimension of the element type.
-// These are compile time to allow for the same geometric operations used in weak forms to apply here.
+//== Interpolation
+
+MAX_INTERP_BLOCKS :: MAX_VERTICES + MAX_EDGES + MAX_FACES + 1
+
+Interp_Block :: struct($A, $I, $F: int) {
+	points:  Pvec(f64), // physical points, 1 x A
+	tangent: Tangent(A, I, f64),
+	out:     Pvec(f64), // filled by the user
+}
+
+Interpolator :: struct($A, $I, $F: int) {
+	space:     Space_Vector,
+	elem:      Entity_ID,
+	bd:        Basis_Desc,
+	geo_bd:    Basis_Desc,
+	vector:    bool, // vector family (RT, Nedelc)
+	value_map: Map_Type,
+	affine:    bool,
+	closure:   Sub_Entity,
+	coords:    Cvec(f64), // geometry nodes of the cell
+	vals:      Cvec(f64), // the cell's reference dof values, filled block by block
+	blocks:    [MAX_INTERP_BLOCKS][2]int, // (dim, local entity) to visit
+	n_blocks:  int,
+	cur:       int,
+	blk:       Interp_Block(A, I, F),
+	temp:      Scratch_Temp,
+}
+
+// Interpolates a function given at physical points onto an FE space
 interpolator :: proc(
-	$A, $I: int,
+	$A, $I, $F: int,
 	geo, space: Space_Vector,
-	et: Element_Type,
-	ent: Entity_ID,
-	restriction: []int = nil,
-) -> Interpolator(A, I) {
-	assert(A == geo.fields)
-	assert(I == int(element_dim(et)))
+	elem: Entity_ID,
+	closure: Maybe(Sub_Entity) = nil, // nil: the whole cell
+) -> (
+	ip: Interpolator(A, I, F),
+) {
+	assert(A == geo.fields && F == space.fields)
+	assert(space.numbering.numbered_over == space.mesh.intrinsic_dim, "interpolation is over cells")
+	cell := &space.mesh.cells[elem]
+	assert(I == int(element_dim(cell.type)))
 
-	bd := space_bd(space.space, et)
-	return Interpolator(A, I) {
-		geometry = geo,
-		space = space,
-		restriction = restriction,
-		ent = ent,
-		et = et,
-		num_dofs = len(restriction) if restriction != nil else basis_count(bd),
-		vals = cvec_create(f64, basis_count(bd), space.fields, scratch()),
-		current_dof = -1,
-		temp = scratch_begin_temp(),
+	ip.temp = scratch_begin_temp()
+	ip.space = space
+	ip.elem = elem
+	ip.bd = space_bd(space.space, cell.type)
+	ip.geo_bd = space_bd(geo.space, cell.type)
+	ip.vector = .V_Val in BASIS_QUANTITIES[ip.bd.family]
+	ip.value_map = basis_quantity_map(ip.bd, .V_Val if ip.vector else .S_Val)
+	ip.affine = cell.affine
+	ip.closure = closure.? or_else element_sub_entity(cell.type, element_dim(cell.type), 0)
+	ip.coords = space_gather(f64, geo, elem, scratch())
+	ip.vals = cvec_create(f64, basis_num_dofs(ip.bd), F, scratch())
+
+	for d in Dimension {
+		if basis_dofs_per_entity(ip.bd, d) == 0 { continue }
+		for e in ip.closure.closure[d] {
+			ip.blocks[ip.n_blocks] = {int(d), e}
+			ip.n_blocks += 1
+		}
 	}
+	ip.cur = -1
+	return
 }
 
-// Yields a point to evaluate at write results into `out` which is sized for each field in the space.
-interpolator_next :: proc(
-	ip: ^Interpolator($A, $I),
-) -> (
-	jac: Small_Mat(A, I, f64),
-	point: Small_Vec(A, f64),
-	out: []f64,
-	ok: bool,
-) {
-	POINT_DIMS :: Contraction_Dims {
-		.CMPNTS = 1,
-		.FIELDS = A,
-	}
-	JAC_DIMS :: Contraction_Dims {
-		.CMPNTS = I,
-		.FIELDS = A,
-	}
-
+// Yields the next sub-entity block to fill. Finishes the previous one first.
+interpolator_next :: proc(ip: ^Interpolator($A, $I, $F)) -> (blk: Interp_Block(A, I, F), ok: bool) {
 	context.allocator = scratch()
 
-	for ip.current_point >= ip.phys_points.points {
-		ip.current_dof += 1
-		if ip.current_dof >= ip.num_dofs {
-			return {}, {}, nil, false
+	if ip.cur >= ip.n_blocks { return }
+	if ip.cur >= 0 { finish_block(ip) }
+	ip.cur += 1
+	if ip.cur >= ip.n_blocks { return }
+
+	d, e := Dimension(ip.blocks[ip.cur][0]), ip.blocks[ip.cur][1]
+	rule := basis_entity_functionals(ip.bd, d, e).rule
+	geo := bstore_sub_entity(ip.geo_bd, d, e, rule) // the cell itself is its own sub-entity
+	np := len(rule.points)
+
+	ip.blk.points = pvec_create(f64, np, 1, A)
+	contract_eval(1, A, ip.blk.points, ip.coords, geo[.S_Val])
+	ip.blk.tangent = tangent_from_nodes(A, I, geo[.S_Grd], ip.coords, ip.affine)
+	ip.blk.out = pvec_create(f64, np, A if ip.vector else 1, F)
+	return ip.blk, true
+
+	finish_block :: proc(ip: ^Interpolator($A, $I, $F)) {
+		d, e := Dimension(ip.blocks[ip.cur][0]), ip.blocks[ip.cur][1]
+		fn := basis_entity_functionals(ip.bd, d, e)
+		ls, n := basis_entity_dof_range(ip.bd, d, e)
+		dofs := Cvec(f64) {
+			dofs   = n,
+			fields = F,
+			data   = ip.vals.data[ls * F:][:n * F],
+		} 	// view into the cell's values
+
+		if !ip.vector {
+			contract_linear(1, F, dofs, fn.weights, ip.blk.out)
+			return
 		}
-		dof := ip.restriction[ip.current_dof] if ip.restriction != nil else ip.current_dof
 
-		spce_bd := space_bd(ip.space, ip.et)
-		geo_bd := space_bd(ip.geometry, ip.et)
-		rule := basis_functional_rule(spce_bd, dof)
+		cov: Piola_Cov(A, I, f64)
+		if ip.value_map == .Contravariant { cov = piola_covariant(ip.blk.tangent) }
 
-		geo_basis: Basis_Entry
-		if rule.element != ip.et {
-			assert(element_dim(rule.element) == element_facet_dim(ip.et))
-			sup := basis_support(spce_bd)[dof]
-			assert(
-				sup.entity_dim == element_dim(rule.element),
-				"bug: DOF functional over facet rule, not facet supported.",
-			)
-			geo_basis = bstore_facet(geo_bd, sup.entity_index, rule)
-		} else {
-			geo_basis = bstore_interior(geo_bd, rule)
+		ref := pvec_create(f64, ip.blk.out.points, I, F)
+		for pt in 0 ..< ref.points {
+			m: Small_Mat(A, I, f64)
+			if ip.value_map == .Covariant {
+				m = tangent_at(ip.blk.tangent, pt)^
+			} else {
+				m = piola_at(cov, pt)
+				small_mat_scale_inplace(&m, tangent_measure(ip.blk.tangent, pt))
+			}
+			pvec_point_matrix(ref, pt, I, F)^ = small_mat_mul(pvec_point_matrix(ip.blk.out, pt, A, F)^, m)
 		}
-
-		coords := space_gather(f64, ip.geometry, ip.ent)
-		ip.phys_points = pvec_create(f64, len(rule.ref_points), POINT_DIMS)
-		ip.jacobians = pvec_create(f64, len(rule.ref_points), JAC_DIMS)
-
-		contract_eval(POINT_DIMS, ip.phys_points, coords, geo_basis[.S_Val])
-		contract_eval(JAC_DIMS, ip.jacobians, coords, geo_basis[.S_Grd])
-
-		ip.current_point = 0
+		contract_linear(I, F, dofs, fn.weights, ref)
 	}
-
-	point = small_vec_view_from_slice(pvec_at_point(ip.phys_points, ip.current_point).data, A)^
-	jac = small_mat_view_from_slice(pvec_at_point(ip.jacobians, ip.current_point).data, A, I)^
-
-	dof := ip.restriction[ip.current_dof] if ip.restriction != nil else ip.current_dof
-	out = cvec_dof_block(ip.vals, dof)
-
-	ip.current_point += 1
-	return jac, point, out, true
 }
 
-// Must be called after interpolation is complete, does not reset the iterator, create new if interpolating again.
-interpolator_flush :: proc(ip: ^Interpolator($A, $I)) {
+// Call once every block has been visited. Does not reset the iterator.
+interpolator_flush :: proc(ip: ^Interpolator($A, $I, $F)) {
 	defer scratch_end_temp(ip.temp)
-	if ip.restriction != nil {
-		space_scatter_masked(ip.space, ip.ent, ip.vals, ip.restriction)
-	} else {
-		space_scatter(ip.space, ip.ent, ip.vals)
+	assert(ip.cur >= ip.n_blocks, "interpolator flushed before every block was visited")
+	if ip.space.continuity == .Continuous {
+		basis_orient_dofs(ip.bd, cell_entity_keys(&ip.space.mesh.cells[ip.elem]), ip.vals)
 	}
+	space_scatter_closure(ip.space, ip.elem, ip.closure, ip.vals)
 }
 
-//== Constraints
+//== Multi Space
 
 Constraint_Essential :: struct {
 	boundaries: Boundary_Set,
@@ -497,7 +366,6 @@ Constraint :: union {
 	Constraint_Periodic,
 }
 
-
 constraint_essential :: proc(boundary: Boundary_ID, leave_free: bit_set[0 ..< MAX_FIELDS] = {}) -> Constraint {
 	return Constraint_Essential{{boundary}, leave_free}
 }
@@ -517,20 +385,29 @@ Constituent_Space :: struct {
 
 //== Multi-Space
 
+// How constrained dofs appear in the solved system.
+//  .Eliminate: removed. The system only has free dofs.
+//  .Identity:  kept as rows u_i = rhs_i (1 on the diagonal), columns still lifted, so the matrix stays symmetric.
+//              Call sys_constrain_rows after assembling.
+Constraint_Mode :: enum {
+	Eliminate,
+	Identity,
+}
+
 Multi_Space :: struct {
-	spaces:           map[Space_ID]^Space,
 	ranges:           []Space_Range,
-	total_state_size: int, // total dofs before elimination
-	total_soln_size:  int, // free dofs after elimination
+	mode:             Constraint_Mode,
+	total_state_size: int, // total dofs
+	total_soln_size:  int, // dofs in the solved system
 	dof_map:          []DOF_Map_Entry, // len == total_state_size, flat, global-indexed
 	soln_to_dof:      []int, // soln idx -> global dof idx
 	arena:            virtual.Arena,
 }
 
 Space_Range :: struct {
-	base: int,
-	end:  int,
-	id:   Space_ID,
+	base:  int,
+	end:   int,
+	space: ^Space,
 }
 
 DOF_Role :: enum {
@@ -545,7 +422,7 @@ MPC_Term :: struct {
 
 DOF_Map_Entry :: struct {
 	role:       DOF_Role,
-	soln_index: int, // valid when Free
+	soln_index: int, // row in the solved system, -1 if eliminated
 	terms:      []MPC_Term, // valid when Constrained, nil for a plain essential dof
 }
 
@@ -557,9 +434,8 @@ Assembly_Mode :: enum {
 // Flat state vector for all spaces in a multi space
 State :: distinct []f64
 
-
-// Combines constituent spaces into one flat dof numbering, applies constraints, and numbers the free dofs.
-ms_create :: proc(mesh: Mesh, spaces: ..Constituent_Space) -> (ms: Multi_Space) {
+// Combines constituent spaces into one flat dof numbering, applies constraints, and numbers the solved dofs.
+ms_create :: proc(mode: Constraint_Mode, spaces: ..Constituent_Space) -> (ms: Multi_Space) {
 	assert(len(spaces) >= 1)
 
 	scratch_guard()
@@ -572,16 +448,15 @@ ms_create :: proc(mesh: Mesh, spaces: ..Constituent_Space) -> (ms: Multi_Space) 
 	if err := virtual.arena_init_growing(&ms.arena); err != nil { panic("Failed to create arena") }
 	context.allocator = virtual.arena_allocator(&ms.arena)
 
-	ms.spaces = make(map[Space_ID]^Space)
+	ms.mode = mode
 	ms.ranges = make([]Space_Range, len(spaces))
 
 	offset := 0
 	for cs, i in spaces {
-		ms.spaces[cs.space.id] = cs.space
 		ms.ranges[i] = {
-			base = offset,
-			end  = offset + cs.space.total_coeffs,
-			id   = cs.space.id,
+			base  = offset,
+			end   = offset + cs.space.total_coeffs,
+			space = cs.space,
 		}
 		offset += cs.space.total_coeffs
 	}
@@ -590,55 +465,52 @@ ms_create :: proc(mesh: Mesh, spaces: ..Constituent_Space) -> (ms: Multi_Space) 
 
 	constrained := make([]bool, ms.total_state_size, scratch())
 
-	// Essential constraints first, always - a periodic pairing can never override a Dirichlet dof.
+	// essential first
 	for cs, i in spaces {
-		base := ms.ranges[i].base
 		for c in cs.constraints {
 			if v, ok := c.(Constraint_Essential);
-			   ok { mark_essential(mesh, cs.space, base, v, ms.dof_map, constrained) }
+			   ok { mark_essential(cs.space, ms.ranges[i].base, v, ms.dof_map, constrained) }
 		}
 	}
 	for cs, i in spaces {
-		base := ms.ranges[i].base
 		for c in cs.constraints {
-			if v, ok := c.(Constraint_Periodic); ok { mark_periodic(mesh, cs.space, base, v, ms.dof_map, constrained) }
+			if v, ok := c.(Constraint_Periodic);
+			   ok { mark_periodic(cs.space, ms.ranges[i].base, v, ms.dof_map, constrained) }
 		}
 	}
 
-	// After this, every MPC_Term.dof points at a Free or terminal-essential dof, never another
-	// periodic dof - everything downstream relies on that to resolve in a single hop.
 	flatten_periodic_chains(ms.dof_map)
 
 	soln_idx := 0
 	for gidx in 0 ..< ms.total_state_size {
-		if constrained[gidx] { continue }
-		ms.dof_map[gidx] = {
-			role       = .Free,
-			soln_index = soln_idx,
+		entry := &ms.dof_map[gidx]
+		if !constrained[gidx] { entry.role = .Free }
+		entry.soln_index = -1
+		if entry.role == .Free || mode == .Identity {
+			entry.soln_index = soln_idx
+			soln_idx += 1
 		}
-		soln_idx += 1
 	}
 	ms.total_soln_size = soln_idx
 
 	ms.soln_to_dof = make([]int, ms.total_soln_size)
-	for gidx in 0 ..< ms.total_state_size {
-		if ms.dof_map[gidx].role == .Free { ms.soln_to_dof[ms.dof_map[gidx].soln_index] = gidx }
+	for entry, gidx in ms.dof_map {
+		if entry.soln_index >= 0 { ms.soln_to_dof[entry.soln_index] = gidx }
 	}
 
 	return ms
 
 	mark_essential :: proc(
-		mesh: Mesh,
 		space: ^Space,
 		base: int,
 		c: Constraint_Essential,
 		dof_map: []DOF_Map_Entry,
 		constrained: []bool,
 	) {
-		for facet in mesh.facets {
+		for facet in space.mesh.facets {
 			if facet.info.boundary not_in c.boundaries { continue }
 			scratch_guard()
-			for dof in space_facet_dofs(mesh, space, facet.id, scratch()) {
+			for dof in space_facet_dofs(space, facet.id, scratch()) {
 				for field in 0 ..< space.fields {
 					if field in c.leave_free { continue }
 					gidx := base + int(dof) * space.fields + field
@@ -652,92 +524,88 @@ ms_create :: proc(mesh: Mesh, spaces: ..Constituent_Space) -> (ms: Multi_Space) 
 		}
 	}
 
-	// Ties each slave facet dof to its corresponding master facet dof (optionally through field_transform).
+	// Ties each slave facet dof to master facet dofs (optionally through field_transform), one sub-entity block
+	// at a time. For facet sub-entity k of dimension d on the master, pair.maps[d][k] is the matching slave
+	// sub-entity and pair.orientations[d][k] the key relating the two canonical orders: element_orientation(type,
+	// master's canonical vertices as slave vertex ids, slave's canonical vertices). Slave block = M^-T master block.
 	mark_periodic :: proc(
-		mesh: Mesh,
 		space: ^Space,
 		base: int,
 		c: Constraint_Periodic,
 		dof_map: []DOF_Map_Entry,
 		constrained: []bool,
 	) {
-		Facet_Dof_Key :: struct {
-			dim:   Dimension,
-			ent:   int,
-			local: int, // sup.entity_dof_index
-		}
-
+		assert(space.continuity == .Continuous, "periodic constraints need a continuous space")
 		xform, has_xform := c.field_transform.?
+		nf := space.fields
 
 		for pair in c.periodicity.pairs {
-			scratch_guard()
+			et := space.mesh.facets[pair.master].info.type
+			cell, _ := facet_canonical_cell(space.mesh^, space.mesh.facets[pair.master])
+			tables := Basis_Desc{cell.type, space.family, space.order} // orientation tables for the facet's blocks
 
-			master_dofs := space_facet_dofs(mesh, space, pair.master, scratch())
-			slave_dofs := space_facet_dofs(mesh, space, pair.slave, scratch())
-			assert(len(master_dofs) == len(slave_dofs), "periodic pair facets have mismatched dof counts")
+			for d in Dimension {
+				if d > element_dim(et) { break }
+				for k in 0 ..< element_num_sub_entities(et, d) {
+					m := facet_entity_dofs(space, pair.master, d, k)
+					if len(m) == 0 { continue }
+					sk := pair.maps[d][k] if d < element_dim(et) else 0
+					s := facet_entity_dofs(space, pair.slave, d, sk)
+					assert(len(s) == len(m), "periodic pair facets have mismatched dof counts")
 
-			et := mesh.facets[pair.master].info.type
-			bd_facet := Basis_Desc{et, space.family, space.order}
+					key := pair.orientations[d][k] if k < len(pair.orientations[d]) else 0
+					t := basis_orientation(tables, element_sub_entity(et, d, k).type, key)
+					n := len(m)
 
-			master_cell, _ := facet_canonical_cell(mesh, mesh.facets[pair.master])
-			bd_cell := Basis_Desc{master_cell.type, space.family, space.order}
+					for i in 0 ..< n {
+						for field in 0 ..< nf {
+							if field in c.leave_free { continue }
+							sgidx := base + int(s[i]) * nf + field
+							if constrained[sgidx] { continue } 	// already tied (by essential, or an earlier pair)
 
-			slave_flat := make(map[Facet_Dof_Key]int, scratch())
-			for sup, dof in basis_support(bd_facet) {
-				slave_flat[{sup.entity_dim, sup.entity_index, sup.entity_dof_index}] = dof
-			}
+							// slave dof i = sum_l A[i, l] master dof l, A = M^-T
+							terms := make([dynamic]MPC_Term, 0, n * nf)
+							for l in 0 ..< n {
+								a: f64
+								switch t.kind {
+								case .Identity: a = 1 if l == i else 0
+								case .Signed_Perm: a = t.sign[i] if l == t.src[i] else 0
+								case .Dense: a = dn_get(t.m_inv, l, i)^
+								}
+								if a == 0 { continue }
 
-			for sup, mldof in basis_support(bd_facet) {
-				sldof: int
-				sign := 1.0
+								if has_xform {
+									for mfield in 0 ..< nf {
+										w := dn_get(xform, field, mfield)^
+										if w != 0 { append(&terms, MPC_Term{base + int(m[l]) * nf + mfield, a * w}) }
+									}
+								} else {
+									append(&terms, MPC_Term{base + int(m[l]) * nf + field, a})
+								}
+							}
 
-				switch sup.entity_dim {
-				case element_dim(et):
-					canonical, flip := basis_orient_dof(bd_cell, et, pair.orientation, sup.entity_dof_index)
-					sldof = slave_flat[{sup.entity_dim, sup.entity_index, canonical}]
-					sign = -1.0 if flip else 1.0
-				case .D0: sldof = slave_flat[{.D0, pair.vertex_map[sup.entity_index], sup.entity_dof_index}]
-				case .D1:
-					canonical, flip := basis_orient_dof(
-						bd_cell,
-						.Line,
-						pair.edge_orientation[sup.entity_index],
-						sup.entity_dof_index,
-					)
-					sldof = slave_flat[{.D1, pair.edge_map[sup.entity_index], canonical}]
-					sign = -1.0 if flip else 1.0
-				case .D2, .D3: unreachable()
-				case: unreachable()
-				}
-
-				for field in 0 ..< space.fields {
-					if field in c.leave_free { continue }
-
-					sgidx := base + int(slave_dofs[sldof]) * space.fields + field
-					if constrained[sgidx] { continue } 	// already tied (by essential, or an earlier pair)
-
-					terms: []MPC_Term
-					if has_xform {
-						buf := make([dynamic]MPC_Term, 0, space.fields)
-						for mfield in 0 ..< space.fields {
-							w := dense_get(xform, field, mfield)^
-							if w == 0 { continue }
-							append(&buf, MPC_Term{base + int(master_dofs[mldof]) * space.fields + mfield, w * sign})
+							dof_map[sgidx] = {
+								role  = .Constrained,
+								terms = terms[:],
+							}
+							constrained[sgidx] = true
 						}
-						terms = buf[:]
-					} else {
-						terms = make([]MPC_Term, 1)
-						terms[0] = {base + int(master_dofs[mldof]) * space.fields + field, sign}
 					}
-
-					dof_map[sgidx] = {
-						role  = .Constrained,
-						terms = terms,
-					}
-					constrained[sgidx] = true
 				}
 			}
 		}
+	}
+
+	// Global dofs of sub-entity k (dimension d, facet-local order) of a facet, in canonical order.
+	facet_entity_dofs :: proc(space: ^Space, facet: Entity_ID, d: Dimension, k: int) -> []i32 {
+		if space.numbering.numbered_over != space.mesh.intrinsic_dim { 	// trace space: the facet is the element
+			ls, n := basis_entity_dof_range(space_bd(space, space.mesh.facets[facet].info.type), d, k)
+			return space.numbering.l2g[facet][ls:][:n]
+		}
+		cell, local_facet := facet_canonical_cell(space.mesh^, space.mesh.facets[facet])
+		e := element_facet(cell.type, local_facet).closure[d][k]
+		ls, n := basis_entity_dof_range(space_bd(space, cell.type), d, e)
+		return space.numbering.l2g[cell.id][ls:][:n]
 	}
 
 	flatten_periodic_chains :: proc(dof_map: []DOF_Map_Entry) {
@@ -757,7 +625,7 @@ ms_create :: proc(mesh: Mesh, spaces: ..Constituent_Space) -> (ms: Multi_Space) 
 			flat := make([dynamic]MPC_Term, 0, len(entry.terms))
 			for term in entry.terms {
 				target := dof_map[term.dof]
-				if target.role == .Free || target.terms == nil {
+				if target.role != .Constrained || target.terms == nil {
 					append(&flat, term) // already terminal
 				} else {
 					flatten_one(dof_map, resolved, visiting, term.dof)
@@ -781,14 +649,14 @@ ms_state_alloc :: proc(ms: Multi_Space, alloc := context.allocator) -> State {
 }
 
 // Returns the raw coefficient slice for `space` out of a flat State buffer.
-ms_state_slice :: proc(ms: Multi_Space, state: State, space: Space_ID) -> []f64 {
+ms_state_slice :: proc(ms: Multi_Space, state: State, space: ^Space) -> []f64 {
 	r := ms_space_range(ms, space)
 	return cast([]f64)state[r.base:r.end]
 }
 
 // Returns the (space, coeffs) view for `space` out of state.
 ms_space_vec :: proc(ms: Multi_Space, state: State, space: ^Space) -> Space_Vector {
-	return {space, ms_state_slice(ms, state, space.id)}
+	return {space, ms_state_slice(ms, state, space)}
 }
 
 // Re-derives every constrained dof's value in `state` from `inhom` and its MPC terms.
@@ -814,7 +682,7 @@ ms_enforce_constraints :: proc(ms: Multi_Space, state: State, inhom: State) {
 	}
 }
 
-// Allocates a vector sized for the free dofs only.
+// Allocates a vector sized for the solved system.
 ms_soln_vector :: proc(ms: Multi_Space, alloc := context.allocator) -> Vector {
 	return make(Vector, ms.total_soln_size, alloc)
 }
@@ -846,35 +714,17 @@ ms_apply_soln :: proc(ms: Multi_Space, state: State, inhom: State, soln: Vector)
 }
 
 // Construct an amgcl-conforming representation of the near nullspace from the given State vectors,
-// Only free dofs are included, matching the reduced system actually solved.
+// covering exactly the rows of the solved system.
 ms_near_null_space :: proc(ms: Multi_Space, vectors: ..State, alloc := context.allocator) -> (nns: []f64, cols: int) {
 	cols = len(vectors)
 	nns = make([]f64, ms.total_soln_size * cols, alloc)
 
-	for r in ms.ranges {
-		for gidx in r.base ..< r.end {
-			entry := ms.dof_map[gidx]
-			if entry.role != .Free { continue }
-			for v, col in vectors { nns[entry.soln_index * cols + col] = v[gidx] }
-		}
+	for entry, gidx in ms.dof_map {
+		if entry.soln_index < 0 { continue }
+		for v, col in vectors { nns[entry.soln_index * cols + col] = v[gidx] }
 	}
 
 	return
-}
-
-// Build the schur mask for amgcl shcur compliment preconditioner.
-ms_schur_mask :: proc(ms: Multi_Space, pressure_space: Space_ID, alloc := context.allocator) -> []u8 {
-	mask := make([]u8, ms.total_soln_size, alloc)
-
-	r := ms_space_range(ms, pressure_space)
-	for gidx in r.base ..< r.end {
-		entry := ms.dof_map[gidx]
-		if entry.role == .Free {
-			mask[entry.soln_index] = 1
-		}
-	}
-
-	return mask
 }
 
 // Frees the multi space's arena.
@@ -882,25 +732,32 @@ ms_destroy :: proc(ms: ^Multi_Space) {
 	virtual.arena_destroy(&ms.arena)
 }
 
-ms_space_range :: proc(ms: Multi_Space, id: Space_ID) -> Space_Range {
-	for r in ms.ranges { if r.id == id { return r } }
+@(private)
+ms_space_range :: proc(ms: Multi_Space, space: ^Space) -> Space_Range {
+	for r in ms.ranges { if r.space == space { return r } }
 	panic("space not in multi space")
 }
 
 //== Sys
 
+// `across_facets`: couple the two cells on each side of every interior facet (DG face terms).
+// `through_cells`: for HDG trace spaces
 Coupling :: struct {
-	test, trial: Space_ID,
+	test, trial:   ^Space,
+	across_facets: bool,
+	through_cells: bool,
 }
 
 Sys :: struct {
 	ms:            Multi_Space,
 	couplings:     []Coupling,
-	couplings_set: map[Coupling]bool,
+	couplings_set: map[[2]^Space]bool,
 	sparsity:      Sparsity,
 	arena:         virtual.Arena,
 }
 
+// Builds the sparsity pattern for exactly the declared (test, trial) couplings
+// For a fully-coupled 2-variable problem (u, p), pass all four: {u,u}, {u,p}, {p,u}, {p,p}.
 // Builds the sparsity pattern for exactly the declared (test, trial) couplings
 // For a fully-coupled 2-variable problem (u, p), pass all four: {u,u}, {u,p}, {p,u}, {p,p}.
 sys_create :: proc(ms: Multi_Space, couplings: ..Coupling) -> (sys: Sys) {
@@ -913,8 +770,8 @@ sys_create :: proc(ms: Multi_Space, couplings: ..Coupling) -> (sys: Sys) {
 	sys.couplings = make([]Coupling, len(couplings))
 	copy(sys.couplings, couplings)
 
-	sys.couplings_set = make(map[Coupling]bool, len(couplings))
-	for c in couplings { sys.couplings_set[c] = true }
+	sys.couplings_set = make(map[[2]^Space]bool, len(couplings))
+	for c in couplings { sys.couplings_set[{c.test, c.trial}] = true }
 
 	build_sparsity(&sys)
 
@@ -929,43 +786,44 @@ sys_create :: proc(ms: Multi_Space, couplings: ..Coupling) -> (sys: Sys) {
 		context.allocator = virtual.arena_allocator(&sys.arena)
 
 		pairs := make([dynamic]Pair, scratch())
-		row_touched := make([dynamic]int, scratch())
-		col_touched := make([dynamic]int, scratch())
+		rows := make([dynamic]int, scratch())
+		cols := make([dynamic]int, scratch())
 
-		entity_count := len(sys.ms.spaces[sys.ms.ranges[0].id].numbering.l2g)
+		add_block :: proc(ms: Multi_Space, c: Coupling, row_elem, col_elem: Entity_ID, rows, cols: ^[dynamic]int, pairs: ^[dynamic]Pair) {
+			clear(rows)
+			clear(cols)
+			collect_elem(ms, c.test, row_elem, rows)
+			collect_elem(ms, c.trial, col_elem, cols)
+			for a in rows { for b in cols { append(pairs, Pair{i32(a), i32(b)}) } }
+		}
 
 		for c in sys.couplings {
-			test_space := sys.ms.spaces[c.test]
-			trial_space := sys.ms.spaces[c.trial]
-			test_base := ms_space_range(sys.ms, c.test).base
-			trial_base := ms_space_range(sys.ms, c.trial).base
+			for e in 0 ..< len(c.test.numbering.l2g) { add_block(sys.ms, c, Entity_ID(e), Entity_ID(e), &rows, &cols, &pairs) }
 
-			for e in 0 ..< entity_count {
-				clear(&row_touched)
-				clear(&col_touched)
-
-				if t_l2g := test_space.numbering.l2g[e]; t_l2g != nil {
-					for gdof in t_l2g {
-						for field in 0 ..< test_space.fields {
-							gidx := test_base + int(gdof) * test_space.fields + field
-							sys_collect_free(sys.ms, gidx, &row_touched)
-						}
-					}
+			mesh := c.test.mesh
+			if c.across_facets {
+				assert(c.test.numbering.numbered_over == mesh.intrinsic_dim, "across_facets couples cells")
+				for facet in mesh.facets {
+					inc := facet_incidences(mesh^, facet)
+					if len(inc) != 2 { continue }
+					a, b := inc[0].cell, inc[1].cell
+					add_block(sys.ms, c, a, b, &rows, &cols, &pairs)
+					add_block(sys.ms, c, b, a, &rows, &cols, &pairs)
 				}
-				if r_l2g := trial_space.numbering.l2g[e]; r_l2g != nil {
-					for gdof in r_l2g {
-						for field in 0 ..< trial_space.fields {
-							gidx := trial_base + int(gdof) * trial_space.fields + field
-							sys_collect_free(sys.ms, gidx, &col_touched)
-						}
+			}
+			if c.through_cells {
+				assert(c.test.numbering.numbered_over != mesh.intrinsic_dim, "through_cells couples facets")
+				for cell in mesh.cells {
+					for a in cell.facets {
+						for b in cell.facets { add_block(sys.ms, c, a, b, &rows, &cols, &pairs) }
 					}
-				}
-
-				for a in row_touched {
-					for b in col_touched { append(&pairs, Pair{i32(a), i32(b)}) }
 				}
 			}
 		}
+
+		// add diagonal entries, this keeps some iterative solvers happy without blowing up sparsity for 0 blocks.
+		// In .Identity mode these are also the constrained rows' identity entries.
+		for i in 0 ..< sys.ms.total_soln_size { append(&pairs, Pair{i32(i), i32(i)}) }
 
 		slice.sort_by(pairs[:], proc(a, b: Pair) -> bool {
 			if a.row != b.row { return a.row < b.row }
@@ -995,60 +853,56 @@ sys_create :: proc(ms: Multi_Space, couplings: ..Coupling) -> (sys: Sys) {
 		}
 	}
 
-	sys_collect_free :: proc(ms: Multi_Space, gidx: int, touched: ^[dynamic]int) {
-		entry := ms.dof_map[gidx]
-		if entry.role == .Free {
-			append(touched, entry.soln_index)
-			return
-		}
-		for term in entry.terms {
-			target := ms.dof_map[term.dof]
-			if target.role == .Free { append(touched, target.soln_index) }
-		}
-	}
-}
-
-// Allocates a sparse matrix with the sparsity pattern of system
-sys_soln_matrix :: proc(sys: Sys, alloc := context.allocator) -> Sparse_Matrix {
-	return sp_from_sparsity(sys.sparsity, alloc)
-}
-
-// Adds a local element vector for `test` at entity `ent` into the reduced global vector `vec`.
-sys_scatter_vec :: proc(sys: Sys, vec: Vector, local: Cvec($T), test: Space_ID, ent: Entity_ID) {
-	space := sys.ms.spaces[test]
-	l2g := space_l2g(space, ent)
-	assert(len(l2g) == local.dofs)
-	assert(local.fields == space.fields)
-
-	base := ms_space_range(sys.ms, test).base
-
-	scratch_guard()
-	touched := make([dynamic]int, scratch())
-
-	for gdof, ldof in l2g {
-		sign := space_dof_sign(space, ent, ldof)
-		lblock := cvec_dof_block(local, ldof)
-		for field in 0 ..< local.fields {
-			gidx := base + int(gdof) * space.fields + field
-			val := cast(f64)lblock[field] * sign
-
-			clear(&touched)
-			entry := sys.ms.dof_map[gidx]
-			if entry.role == .Free {
-				vec[entry.soln_index] += val
-			} else {
+	// Solved-system rows an element's dofs of `space` land on (free dofs, or the free masters of constrained ones).
+	collect_elem :: proc(ms: Multi_Space, space: ^Space, elem: Entity_ID, touched: ^[dynamic]int) {
+		l2g := space.numbering.l2g[elem]
+		if l2g == nil { return }
+		base := ms_space_range(ms, space).base
+		for gdof in l2g {
+			for field in 0 ..< space.fields {
+				entry := ms.dof_map[base + int(gdof) * space.fields + field]
+				if entry.role == .Free {
+					append(touched, entry.soln_index)
+					continue
+				}
 				for term in entry.terms {
-					target := sys.ms.dof_map[term.dof]
-					if target.role == .Free { vec[target.soln_index] += val * term.weight }
+					if target := ms.dof_map[term.dof]; target.role == .Free { append(touched, target.soln_index) }
 				}
 			}
 		}
 	}
 }
 
-// Adds a local element matrix for (test, trial) at entity `ent` into `mat`. Linear mode lifts
-// constrained columns into `load` using `inhom`, Newton mode ignores both. test and trial must have
-// been declared couplings.
+// Allocates a sparse matrix with the sparsity pattern of system
+sys_soln_matrix :: proc(sys: Sys, alloc := context.allocator) -> Sparse_Matrix {
+	return sparse_from_sparsity(sys.sparsity, alloc)
+}
+
+// Adds a local element vector (built with the oriented basis) for `test` at element `ent` into `vec`.
+sys_scatter_vec :: proc(sys: Sys, vec: Vector, local: Cvec($T), test: ^Space, ent: Entity_ID) {
+	base := ms_space_range(sys.ms, test).base
+	l2g := test.numbering.l2g[ent]
+	assert(len(l2g) == local.dofs && local.fields == test.fields)
+
+	for gdof, ldof in l2g {
+		lblock := cvec_dof_block(local, ldof)
+		for field in 0 ..< local.fields {
+			entry := sys.ms.dof_map[base + int(gdof) * test.fields + field]
+			val := cast(f64)lblock[field]
+			if entry.role == .Free {
+				vec[entry.soln_index] += val
+			} else {
+				for term in entry.terms {
+					if target := sys.ms.dof_map[term.dof];
+					   target.role == .Free { vec[target.soln_index] += val * term.weight }
+				}
+			}
+		}
+	}
+}
+
+// Adds a local element matrix (built with the oriented basis) for (test, trial) at element `ent` into `mat`.
+// Linear mode lifts constrained columns into `load` using `inhom`, Newton mode ignores both.
 sys_scatter_mat :: proc(
 	sys: Sys,
 	mat: Sparse_Matrix,
@@ -1056,36 +910,42 @@ sys_scatter_mat :: proc(
 	inhom: State,
 	mode: Assembly_Mode,
 	local: Cmat($T),
-	test, trial: Space_ID,
+	test, trial: ^Space,
 	ent: Entity_ID,
 ) {
-	assert(mode == .Newton || load != nil, "Linear mode needs a load vector to move constrained columns into")
-	assert(Coupling{test, trial} in sys.couplings_set, "(test, trial) pair was not declared in sys_create")
+	sys_scatter_mat_pair(sys, mat, load, inhom, mode, local, test, trial, ent, ent)
+}
 
-	tspace := sys.ms.spaces[test]
-	rspace := sys.ms.spaces[trial]
+// Same, with rows from `test_ent` and columns from `trial_ent` (DG face terms between neighbouring cells;
+// the coupling must be declared with across_facets).
+sys_scatter_mat_pair :: proc(
+	sys: Sys,
+	mat: Sparse_Matrix,
+	load: Vector,
+	inhom: State,
+	mode: Assembly_Mode,
+	local: Cmat($T),
+	test, trial: ^Space,
+	test_ent, trial_ent: Entity_ID,
+) {
+	assert(mode == .Newton || load != nil, "Linear mode needs a load vector.")
+	assert([2]^Space{test, trial} in sys.couplings_set, "pair was not declared in sys_create")
 
-	rows := space_l2g(tspace, ent)
-	cols := space_l2g(rspace, ent)
+	test_base := ms_space_range(sys.ms, test).base
+	trial_base := ms_space_range(sys.ms, trial).base
+	rows := test.numbering.l2g[test_ent]
+	cols := trial.numbering.l2g[trial_ent]
 	assert(len(rows) == local.row_dofs && len(cols) == local.col_dofs)
-	assert(local.row_fields == tspace.fields && local.col_fields == rspace.fields)
-
-	tbase := ms_space_range(sys.ms, test).base
-	rbase := ms_space_range(sys.ms, trial).base
+	assert(local.row_fields == test.fields && local.col_fields == trial.fields)
 
 	for rgdof, rldof in rows {
-		rsign := space_dof_sign(tspace, ent, rldof)
 		for cgdof, cldof in cols {
-			csign := space_dof_sign(rspace, ent, cldof)
-			sign := rsign * csign
 			block := cmat_dof_block(local, rldof, cldof)
-
 			for rf in 0 ..< local.row_fields {
-				grow := tbase + int(rgdof) * tspace.fields + rf
+				grow := test_base + int(rgdof) * test.fields + rf
 				for cf in 0 ..< local.col_fields {
-					gcol := rbase + int(cgdof) * rspace.fields + cf
-					val := cast(f64)block[cf * local.row_fields + rf] * sign
-					distribute(sys.ms, mat, load, inhom, mode, grow, gcol, val)
+					gcol := trial_base + int(cgdof) * trial.fields + cf
+					distribute(sys.ms, mat, load, inhom, mode, grow, gcol, cast(f64)block[cf * local.row_fields + rf])
 				}
 			}
 		}
@@ -1117,6 +977,19 @@ sys_scatter_mat :: proc(
 		p := sp_get(mat, rentry.soln_index, centry.soln_index)
 		assert(p != nil, "column not found in sparsity pattern for row")
 		p^ += val
+	}
+}
+
+// .Identity mode: call after assembling. Gives each constrained dof the row u_i = rhs_i (1 on the diagonal).
+// Linear: rhs_i = inhom_i. Newton: rhs_i = 0 (ms_apply_update re-derives constrained values anyway).
+// No-op in .Eliminate mode.
+sys_constrain_rows :: proc(sys: Sys, mat: Sparse_Matrix, rhs: Vector, inhom: State, mode: Assembly_Mode) {
+	if sys.ms.mode != .Identity { return }
+	for entry, gidx in sys.ms.dof_map {
+		if entry.role != .Constrained { continue }
+		i := entry.soln_index
+		sp_get(mat, i, i)^ = 1
+		if rhs != nil { rhs[i] = inhom[gidx] if mode == .Linear else 0 }
 	}
 }
 

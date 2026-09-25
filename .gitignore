@@ -1,6 +1,6 @@
 odinfmt.json
-build
-*.vtu
-*.pvd
+build/*
+!build/.gitkeep
+validation/output/*
+!validation/output/.gitkeep
 todo.md
-chlog.md

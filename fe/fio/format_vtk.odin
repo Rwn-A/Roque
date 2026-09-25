@@ -17,9 +17,9 @@ VTU_Config :: struct {
 }
 
 VTU_Writer :: struct {
-	viz_mesh: VTU_Mesh,
-	cfg:      VTU_Config,
-	arena:    virtual.Arena,
+	viz_mesh:   VTU_Mesh,
+	cfg:        VTU_Config,
+	arena:      virtual.Arena,
 	pvd_fd:     ^os.File,
 	pvd_writer: XML_Writer,
 }
@@ -93,32 +93,26 @@ vtu_output_writer :: proc(
 		fe.scratch_guard()
 
 		rule := fe.Rule {
-			ref_points = SUBCELLS[cell.type][order].points,
-			weights    = nil,
-			element    = cell.type,
+			points  = SUBCELLS[cell.type][order].points,
+			element = cell.type,
 		}
 
 		basis := fe.bstore_interior(fe.space_bd(coord_space, cell.type), rule)
 		elem_coords := fe.space_gather(f64, {coord_space, coords}, cell.id, context.temp_allocator)
 
-		phys_points := fe.pvec_create(
-			f64,
-			len(rule.ref_points),
-			{.CMPNTS = 1, .FIELDS = coord_space.fields},
-			context.temp_allocator,
-		)
+		phys_points := fe.pvec_create(f64, len(rule.points), 1, coord_space.fields, context.temp_allocator)
 
 		// Because contractions need compile-time dims
 		switch coord_space.fields {
-		case 1: fe.contract_eval({.CMPNTS = 1, .FIELDS = 1}, phys_points, elem_coords, basis[.S_Val])
-		case 2: fe.contract_eval({.CMPNTS = 1, .FIELDS = 2}, phys_points, elem_coords, basis[.S_Val])
-		case 3: fe.contract_eval({.CMPNTS = 1, .FIELDS = 3}, phys_points, elem_coords, basis[.S_Val])
+		case 1: fe.contract_eval(1, 1, phys_points, elem_coords, basis[.S_Val])
+		case 2: fe.contract_eval(1, 2, phys_points, elem_coords, basis[.S_Val])
+		case 3: fe.contract_eval(1, 3, phys_points, elem_coords, basis[.S_Val])
 		case: unreachable()
 		}
 
 		base_vertex_idx := i32(len(vertices))
 
-		for i in 0 ..< len(rule.ref_points) {
+		for i in 0 ..< len(rule.points) {
 			pvp := fe.pvec_at_point(phys_points, i)
 			padded_point: [3]f64
 			copy(padded_point[:], pvp.data)
@@ -145,7 +139,7 @@ vtu_output_writer :: proc(
 }
 
 vtu_write :: proc(w: ^VTU_Writer, req: Write_Request) -> bool {
-	if fe.rank_count() != 1 {panic("Tried to write file from multiple threads at once.")}
+	if fe.rank_count() != 1 { panic("Tried to write file from multiple threads at once.") }
 
 	if len(req.fields) == 0 {
 		log.warnf("Nothing to output: Not writing to %s", req.path); return false
@@ -367,7 +361,7 @@ XML_Attribute :: struct {
 
 @(private = "file")
 xml_writer_write_string :: proc(xml_w: ^XML_Writer, s: string) {
-	if xml_w.err != nil do return
+	if xml_w.err != nil { return }
 	_, err := io.write_string(xml_w.w, s)
 	if err != nil {
 		xml_w.err = err
@@ -376,7 +370,7 @@ xml_writer_write_string :: proc(xml_w: ^XML_Writer, s: string) {
 
 @(private = "file")
 xml_writer_write_bytes :: proc(xml_w: ^XML_Writer, data: []u8) {
-	if xml_w.err != nil do return
+	if xml_w.err != nil { return }
 	_, err := io.write(xml_w.w, data)
 	if err != nil {
 		xml_w.err = err
@@ -386,7 +380,7 @@ xml_writer_write_bytes :: proc(xml_w: ^XML_Writer, data: []u8) {
 
 @(private = "file")
 xml_writer_printf :: proc(xml_w: ^XML_Writer, format: string, args: ..any) {
-	if xml_w.err != nil do return
+	if xml_w.err != nil { return }
 	s := fmt.tprintf(format, ..args)
 	xml_writer_write_string(xml_w, s)
 }

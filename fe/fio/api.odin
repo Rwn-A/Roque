@@ -66,7 +66,7 @@ output_setup :: proc(
 ) -> (Output_Writer, Output_Rules) {
 	rules: Output_Rules
 	for elem in mesh.encountered_cell_types{
-		rules[elem] = {ref_points = SUBCELLS[elem][order].points, weights = nil, element = elem}
+		rules[elem] = {points = SUBCELLS[elem][order].points, element = elem}
 	}
 
 	switch c in cfg{
@@ -104,7 +104,7 @@ output_field_create :: proc(mesh: fe.Mesh, name: string, cmpnts: int, rules: Out
 	of: Output_Field
 	of.data = make([][]f64, len(mesh.cells))
 	for cell in mesh.cells{
-		of.data[cell.id] = make([]f64, len(rules[cell.type].ref_points) * cmpnts)
+		of.data[cell.id] = make([]f64, len(rules[cell.type].points) * cmpnts)
 	}
 	of.value_components = cmpnts
 	of.name = name

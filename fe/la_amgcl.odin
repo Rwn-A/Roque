@@ -62,7 +62,7 @@ Schur_Extra :: struct {
 	variant:       c.int,
 	approx_schur:  c.bool,
 	usolver_relax: Relax_Kind,
-	adjust_p: bool,
+	adjust_p:      bool,
 }
 
 Precond_Extra :: struct #raw_union {
@@ -236,7 +236,7 @@ amgcl_precond_create :: proc(
 	precond: ^Precond,
 	success: bool,
 ) {
-	n := sp_rows(m)
+	n := sp_n_rows(m)
 	assert(n > 0, "row_ptrs must have at least 2 entries")
 	assert(len(m.columns) == int(m.row_ptrs[n]), "columns length must match row_ptrs[n]")
 	assert(len(m.values) == len(m.columns), "values length must match columns length")

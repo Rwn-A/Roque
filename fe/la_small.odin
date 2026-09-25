@@ -1,11 +1,11 @@
 package fe
 
 /*
- Small fixed-size linear algebra containers.
+ Small fixed-size matrices & vectors.
 
- Odins builtin matrix type is unfortanately not suitable because our backing type may be a SIMD array. However
- for cases where the backing type is a plain float, there are helpers to switch to odins builtin matrix type and
- leverage the operator overloads and more complete linalg utilities.
+ Backed by arbitrary type T to support SIMD operations.
+
+ Implementation has been limited to whats been needed by contractions & geometry.
 */
 
 import "base:intrinsics"
@@ -87,7 +87,7 @@ small_mat_view_from_slice :: proc(data: []$T, $R, $C: int) -> ^Small_Mat(R, C, T
 }
 
 // Odin matrix representation of the small matrix, only usable if T is supported by Odins matrix.
-small_mat_view_as_odin :: proc(m: ^Small_Mat($R, $C, $T)) -> ^matrix[R, C]T {
+small_mat_view_as_matrix :: proc(m: ^Small_Mat($R, $C, $T)) -> ^matrix[R, C]T {
 	return cast(^matrix[R, C]T)m.data
 }
 
@@ -101,6 +101,7 @@ small_mat_transpose :: proc(m: Small_Mat($R, $C, $T)) -> (r: Small_Mat(C, R, T))
 	return r
 }
 
+// Return columns as small vectors
 small_mat_columns :: proc(m: Small_Mat($R, $C, $T)) -> (r: [C]Small_Vec(R, T)) {
 	#unroll for col in 0 ..< C {
 		r[col].data = m.data[col]
@@ -108,6 +109,7 @@ small_mat_columns :: proc(m: Small_Mat($R, $C, $T)) -> (r: [C]Small_Vec(R, T)) {
 	return r
 }
 
+// Perform the standard matrix vector product, where `v` is a column vector.
 small_mat_vec_mul :: proc(m: Small_Mat($R, $C, $T), v: Small_Vec(C, T)) -> (r: Small_Vec(R, T)) {
 	#unroll for col in 0 ..< C {
 		#unroll for row in 0 ..< R {
@@ -117,7 +119,7 @@ small_mat_vec_mul :: proc(m: Small_Mat($R, $C, $T), v: Small_Vec(C, T)) -> (r: S
 	return r
 }
 
-// Multply by the transpose of `m`.
+// Matrix vector product of where `v` is a row vector. (M * v^T)
 small_mat_vec_mul_t :: proc(m: Small_Mat($R, $C, $T), v: Small_Vec(R, T)) -> (r: Small_Vec(C, T)) {
 	#unroll for col in 0 ..< C {
 		#unroll for row in 0 ..< R {
@@ -127,14 +129,16 @@ small_mat_vec_mul_t :: proc(m: Small_Mat($R, $C, $T), v: Small_Vec(R, T)) -> (r:
 	return r
 }
 
-small_mat_scale_inplace :: proc(m: ^Small_Mat($R, $C, $T), s: T) {
+// dst *= scale
+small_mat_scale_inplace :: proc(m: ^Small_Mat($R, $C, $T), scale: T) {
 	#unroll for col in 0 ..< C {
 		#unroll for row in 0 ..< R {
-			m.data[col][row] *= s
+			m.data[col][row] *= scale
 		}
 	}
 }
 
+// dst += src * scale
 small_mat_add_inplace :: proc(dst: ^Small_Mat($R, $C, $T), src: Small_Mat(R, C, T), scale: T) {
 	#unroll for col in 0 ..< C {
 		#unroll for row in 0 ..< R {
@@ -143,7 +147,7 @@ small_mat_add_inplace :: proc(dst: ^Small_Mat($R, $C, $T), src: Small_Mat(R, C, 
 	}
 }
 
-// Add the transpose of `src` into `dst`
+// dst += src^T * scale
 small_mat_add_inplace_t :: proc(dst: ^Small_Mat($C, $R, $T), src: Small_Mat(R, C, T), scale: T) {
 	#unroll for col in 0 ..< C {
 		#unroll for row in 0 ..< R {
@@ -161,12 +165,23 @@ small_vec_outer :: proc(dst: ^Small_Mat($R, $C, $T), a: Small_Vec(R, T), b: Smal
 	}
 }
 
+// Perform a matrix multiply, (single contraction), between a & b.
 small_mat_mul :: proc(a: Small_Mat($R, $K, $T), b: Small_Mat(K, $C, T)) -> (r: Small_Mat(R, C, T)) {
 	#unroll for col in 0 ..< C {
 		#unroll for k in 0 ..< K {
 			#unroll for row in 0 ..< R {
 				r.data[col][row] += a.data[k][row] * b.data[col][k]
 			}
+		}
+	}
+	return r
+}
+
+// Frobenius inner product (double contraction) between a & b.
+small_mat_frob :: proc(a: Small_Mat($R, $K, $T), b: Small_Mat(R, K, T)) -> (r: T) {
+	#unroll for col in 0 ..< K {
+		#unroll for row in 0 ..< R {
+			r += a.data[col][row] * b.data[col][row]
 		}
 	}
 	return r
@@ -203,6 +218,7 @@ small_mat3x3_det :: proc(m: Small_Mat(3, 3, $T)) -> T {
 	)
 }
 
+// Standard determinant
 small_mat_det :: proc {
 	small_mat1x1_det,
 	small_mat2x2_det,
@@ -271,7 +287,7 @@ small_mat3x2_inv_t :: proc(m: Small_Mat(3, 2, $T)) -> Small_Mat(3, 2, T) {
 	return small_mat_mul(m, small_mat2x2_inv_t(small_mat_gram(m)))
 }
 
-// Generalized "scaling" of the matrix
+// Generalized "scaling" of the transformation, equivalent to abs(determinant) for square cases.
 small_mat_measure :: proc {
 	small_mat1x1_measure,
 	small_mat2x1_measure,
@@ -281,7 +297,7 @@ small_mat_measure :: proc {
 	small_mat3x3_measure,
 }
 
-// Inverse (or pseudo-inverse) transpoe
+// Inverse (or pseudo-inverse) transpose.
 small_mat_inv_t :: proc {
 	small_mat1x1_inv_t,
 	small_mat2x1_inv_t,

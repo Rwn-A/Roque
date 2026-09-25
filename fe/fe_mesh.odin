@@ -21,13 +21,16 @@ Boundary_Set :: bit_set[0 ..< max(Boundary_ID)]
 NOT_A_BOUNDARY :: -1
 ALL_REGIONS: Region_Set : ~{}
 
+Entity_Orientation :: [Dimension][]u8
+
 Mesh :: struct {
 	cells:                  []Cell,
-	cell_conn:              []Cell_Conn, // parallel array to cells
+	cell_conn:              []Connectivity, // parallel array to cells
 	facets:                 []Facet,
 	incidences:             []Facet_Incidence,
-	cell_nodes:             [][]Entity_ID, // NOTE: must be same structure as an l2g in DOF numbering
 	periodics:              []Periodicity,
+	n_entities:             [Dimension]int, // global entity counts per dimension, sizes space numbering
+	cell_nodes:             [][]Entity_ID, // [cell][local node] -> index into nodes, reference node order (l2g)
 	nodes:                  [][3]f64,
 	order:                  Order,
 	intrinsic_dim:          Dimension,
@@ -39,15 +42,14 @@ Mesh :: struct {
 
 Cell :: struct {
 	id:               Entity_ID,
-	facets:           []Entity_ID, // directly references of the arrays from connectivity depending on dim.
-	edge_orientation: [MAX_EDGES]u8,
-	face_orientation: [MAX_FACETS]u8,
+	facets:           []Entity_ID, // aliases cell_conn[id][facet dim]
+	edge_orientation: [MAX_EDGES]u8, // read through cell_orientation
+	face_orientation: [MAX_FACES]u8, // read through cell_orientation
 	using info:       Cell_Info,
 }
 
-Cell_Conn :: struct {
-	faces, edges, vertices: []Entity_ID,
-}
+// Global ids of an element's sub-entities, in reference-element order. [own dim] = {own id}.
+Connectivity :: [Dimension][]Entity_ID
 
 Cell_Info :: struct {
 	affine: bool,
@@ -55,11 +57,14 @@ Cell_Info :: struct {
 	type:   Element_Type,
 }
 
+// A facet's local vertex order (as an element, for trace spaces) is the order its canonical cell sees it in,
+// which must also be its canonical order, so only its edges can be oriented.
 Facet :: struct {
-	id:              Entity_ID,
-	incidence_count: i8,
-	incidence_start: int,
-	info:            Facet_Info,
+	id:               Entity_ID,
+	incidence_count:  i8,
+	incidence_start:  int,
+	edge_orientation: [MAX_EDGES]u8,
+	info:             Facet_Info,
 }
 
 Facet_Info :: struct {
@@ -79,14 +84,11 @@ Periodicity :: struct {
 	pairs:         []Periodic_Pair,
 }
 
+// Matches a master facet to its slave facet.
 Periodic_Pair :: struct {
-	master, slave:    Entity_ID, // facet ids
-	vertex_map:       []int, // et-local vertex correspondence: vertex_map[master_local_v] = slave_local_v.
-	orientation:      u8, // Orientation relating master cannonical rotation to slaves
-
-	// for 3d only, edge orientation mappings.
-	edge_map:         []int,
-	edge_orientation: []u8,
+	master, slave: Entity_ID, // facet ids
+	maps:          [Dimension][]int, // maps[d][master local] = slave local
+	orientations:  [Dimension][]u8, // orientations[d][master local]
 }
 
 //== Accessors & general mesh queries
@@ -159,6 +161,20 @@ mesh_coord_coeffs :: proc(mesh: Mesh, frame: Small_Mat(3, $C, f64), alloc := con
 	return out
 }
 
+// Orientation keys of a cell's sub-entities, [dim][local entity], for basis_orient. Views into the cell.
+// Entries that never orient (vertices, the cell itself) are left 0 by the loader.
+cell_entity_keys :: proc(c: ^Cell) -> (k: Entity_Orientation) {
+	k[.D1] = c.edge_orientation[:]
+	k[.D2] = c.face_orientation[:]
+	return
+}
+
+// Same for a facet used as an element (trace spaces): only a 3D facet's edges orient.
+facet_entity_keys :: proc(f: ^Facet) -> (k: Entity_Orientation) {
+	k[.D1] = f.edge_orientation[:]
+	return
+}
+
 // All local facet indices of the cells boundary facets
 cell_boundary_facet_set :: proc(mesh: Mesh, c: Cell) -> (r: bit_set[0 ..< MAX_FACETS]) {
 	for local_facet, i in c.facets {
@@ -175,6 +191,17 @@ cell_boundary_facet_set_of :: proc(mesh: Mesh, c: Cell, bs: Boundary_Set) -> (r:
 		if facet.info.boundary in bs { r += {int(i)} }
 	}
 	return r
+}
+
+// Connectivity of a facet as an element, in its own local order.
+facet_connectivity :: proc(mesh: Mesh, facet: Entity_ID, alloc := context.allocator) -> (conn: Connectivity) {
+	cell, local_facet := facet_canonical_cell(mesh, mesh.facets[facet])
+	f := element_facet(cell.type, local_facet)
+	for d in Dimension {
+		conn[d] = make([]Entity_ID, len(f.closure[d]), alloc)
+		for cell_local, k in f.closure[d] { conn[d][k] = mesh.cell_conn[cell.id][d][cell_local] }
+	}
+	return
 }
 
 facet_incidences :: proc(mesh: Mesh, facet: Facet) -> []Facet_Incidence {
@@ -202,105 +229,3 @@ facet_regions :: proc(mesh: Mesh, facet: Facet) -> (r: Region_Set) {
 //== Parallel & Batching
 
 //TODO:
-
-//== Builtin basic meshes
-
-// 1D mesh along X. boundaries: "left", "right" region: "domain".
-segment_mesh :: proc(n_cells: int, start, end: f64) -> Mesh {
-	assert(n_cells > 0)
-
-	n_points := n_cells + 1
-
-	mesh: Mesh
-	assert(virtual.arena_init_growing(&mesh.arena) == nil)
-	context.allocator = virtual.arena_allocator(&mesh.arena)
-
-	mesh.order = .O1
-	mesh.intrinsic_dim = .D1
-	mesh.encountered_cell_types = {.Line}
-
-	mesh.boundary_names = make(map[string]Boundary_ID)
-	mesh.boundary_names["left"] = 0
-	mesh.boundary_names["right"] = 1
-
-	mesh.region_names = make(map[string]Region_ID)
-	mesh.region_names["domain"] = 0
-	domain_id := mesh.region_names["domain"]
-
-	mesh.nodes = make([][3]f64, n_points)
-	dx := (end - start) / f64(n_cells)
-	for i in 0 ..< n_points { mesh.nodes[i] = {start + f64(i) * dx, 0, 0} }
-
-	mesh.cells = make([]Cell, n_cells)
-	mesh.cell_conn = make([]Cell_Conn, n_cells)
-
-	for c in 0 ..< n_cells {
-		verts := make([]Entity_ID, 2)
-		verts[0], verts[1] = Entity_ID(c), Entity_ID(c + 1)
-		mesh.cell_conn[c].vertices = verts
-
-		mesh.cells[c] = Cell {
-			id = Entity_ID(c),
-			facets = verts,
-			info = Cell_Info{affine = true, region = domain_id, type = .Line},
-		}
-	}
-
-	mesh.facets = make([]Facet, n_points)
-	mesh.incidences = make([]Facet_Incidence, 2 * n_cells)
-
-	left_id := mesh.boundary_names["left"]
-	right_id := mesh.boundary_names["right"]
-
-	mesh.incidences[0] = Facet_Incidence {
-		local_facet = 0,
-		cell        = 0,
-	}
-	mesh.facets[0] = Facet {
-		id = 0,
-		incidence_count = 1,
-		incidence_start = 0,
-		info = Facet_Info{affine = true, boundary = left_id, type = .Point},
-	}
-
-	for p in 1 ..< n_points - 1 {
-		off := 2 * p - 1
-		mesh.incidences[off] = Facet_Incidence {
-			local_facet = 1,
-			cell        = Entity_ID(p - 1),
-		}
-		mesh.incidences[off + 1] = Facet_Incidence {
-			local_facet = 0,
-			cell        = Entity_ID(p),
-		}
-		mesh.facets[p] = Facet {
-			id = Entity_ID(p),
-			incidence_count = 2,
-			incidence_start = off,
-			info = Facet_Info{affine = true, boundary = Boundary_ID(NOT_A_BOUNDARY), type = .Point},
-		}
-	}
-
-	last := n_points - 1
-	off := 2 * n_cells - 1
-	mesh.incidences[off] = Facet_Incidence {
-		local_facet = 1,
-		cell        = Entity_ID(n_cells - 1),
-	}
-	mesh.facets[last] = Facet {
-		id = Entity_ID(last),
-		incidence_count = 1,
-		incidence_start = off,
-		info = Facet_Info{affine = true, boundary = right_id, type = .Point},
-	}
-
-	l2g := make([][]i32, n_cells)
-	for c in 0 ..< n_cells {
-		l2g[c] = make([]i32, 2)
-		l2g[c][0], l2g[c][1] = i32(c), i32(c + 1)
-	}
-
-	mesh.cell_nodes = l2g
-
-	return mesh
-}
