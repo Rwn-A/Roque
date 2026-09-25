@@ -26,6 +26,7 @@ small_vec_from_slice :: proc($VT: typeid, data: []$ST, $N: int) -> (r: Small_Vec
 	return r
 }
 
+// a . b
 small_vec_dot :: proc(a, b: Small_Vec($N, $T)) -> (r: T) {
 	#unroll for i in 0 ..< N {
 		r += a.data[i] * b.data[i]
@@ -33,6 +34,7 @@ small_vec_dot :: proc(a, b: Small_Vec($N, $T)) -> (r: T) {
 	return r
 }
 
+// r = a + b
 small_vec_add :: proc(a, b: Small_Vec($N, $T)) -> (r: Small_Vec(N, T)) {
 	#unroll for i in 0 ..< N {
 		r.data[i] = a.data[i] + b.data[i]
@@ -40,6 +42,7 @@ small_vec_add :: proc(a, b: Small_Vec($N, $T)) -> (r: Small_Vec(N, T)) {
 	return r
 }
 
+// r = s * r
 small_vec_scale :: proc(a: Small_Vec($N, $T), s: T) -> (r: Small_Vec(N, T)) {
 	#unroll for i in 0 ..< N {
 		r.data[i] = a.data[i] * s
@@ -47,10 +50,12 @@ small_vec_scale :: proc(a: Small_Vec($N, $T), s: T) -> (r: Small_Vec(N, T)) {
 	return r
 }
 
+// len(a)
 small_vec_norm :: proc(a: Small_Vec($N, $T)) -> T {
 	return intrinsics.sqrt(small_vec_dot(a, a))
 }
 
+// a / len(a)
 small_vec_normalize :: proc(a: Small_Vec($N, $T)) -> Small_Vec(N, T) {
 	return small_vec_scale(a, T(1) / small_vec_norm(a))
 }
@@ -69,6 +74,7 @@ small_vec2_cross :: proc(a, b: Small_Vec(2, $T)) -> T {
 	return (a.data.y * b.data.x) - (a.data.x * b.data.y)
 }
 
+// a x b (for vectors where the cross product is well defined)
 small_vec_cross :: proc {
 	small_vec3_cross,
 	small_vec2_cross,

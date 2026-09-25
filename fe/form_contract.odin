@@ -12,6 +12,7 @@ package fe
  the element type, basis family, basis order & quadrature rule are flexible at runtime.
 */
 
+// Basis values for a specific basis quantity each quantity is `cmpnts` long.
 Bvec :: struct(T: typeid) {
 	points, dofs, cmpnts: int,
 	data:                 []T,
@@ -42,7 +43,7 @@ bvec_dof_vec :: proc(bvp: Bvec_Point($T), dof: int, $C: int) -> ^Small_Vec(C, T)
 	return small_vec_view_from_slice(bvec_dof_block(bvp, dof), C)
 }
 
-
+// Point space data, `cmpnts` should match basis quantity fields is independent direction for stacking.
 Pvec :: struct(T: typeid) {
 	points, cmpnts, fields: int,
 	data:                   []T,
@@ -67,6 +68,7 @@ pvec_point_matrix :: proc(pvec: Pvec($T), point: int, $C, $F: int) -> ^Small_Mat
 	return small_mat_view_from_slice(pvec.data[point * pvec.cmpnts * pvec.fields:], F, C)
 }
 
+// Coefficient vector, result of a local element weak form
 Cvec :: struct(T: typeid) {
 	dofs, fields: int,
 	data:         []T,
@@ -111,6 +113,7 @@ cvec_push_inplace_t :: proc($F: int, c: Cvec($T), frames: []Small_Mat(F, F, T)) 
 	}
 }
 
+// Coefficient space matrix, result of a local element weak form
 Cmat :: struct(T: typeid) {
 	row_dofs, col_dofs:     int,
 	row_fields, col_fields: int,
@@ -179,7 +182,7 @@ cmat_push_inplace_t :: proc(c: Cmat($T), rframes: []Small_Mat($RF, RF, T), cfram
 	}
 }
 
-
+// Matrix of point space data, commonly a 4th order tensor such as the constitutive tensor in elasticty.
 Pmat :: struct(T: typeid) {
 	points:                 int,
 	layout:                 Pmat_Layout,
@@ -235,6 +238,7 @@ pmat_create :: proc(
 	return {points = np, layout = layout, field_blocks_per_point = num_blocks, data = data}
 }
 
+// Create a symmetric point matrix
 pmat_create_symmetric :: proc($T: typeid, np, cmpnts, fields: int, alloc := context.allocator) -> Pmat(T) {
 	return pmat_create(T, np, .SYMMETRIC, cmpnts, fields, cmpnts, fields, alloc)
 }
@@ -285,7 +289,6 @@ contract_eval :: proc($CM, $FD: int, p: Pvec($T), c: Cvec(T), b: Bvec($BT)) {
 		}
 	}
 }
-
 
 // c += b * p
 contract_linear :: proc($CM, $FD: int, c: Cvec($T), b: Bvec(T), p: Pvec(T)) {

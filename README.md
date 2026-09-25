@@ -101,3 +101,13 @@ unnecessary work.
 Roque is set up for threading with a simple single-program-multiple-data model, but the graph colouring and iteration
 helpers aren't implemented yet. SIMD is a similar story: the core infrastructure works naturally for SIMD across
 elements, but building and iterating batches isn't implemented yet.
+
+## Notes on AI
+
+The purpose of this project was to write a library we understood and were happy with. As a result, AI was not used to design the core APIs or architecture. AI was used for the following:
+
+- **AMGCL C++ bindings.** Writing C++ is old news in the year of our Lord 2026, so we let our benevolent overlords at Anthropic handle it. Its largely an exercise in wrapping template gynmastics behind runtime interfaces. 
+- **Reference element table generator.** We designed the schema and the actual tables we wanted. AI wrote the Python script used to generate them. As we go to higher polynomial orders, this will eventually need some hand intervention and thoughtful design, but for now it is largely mechanical and I'd rather not spend much time on it.
+- **Temporary implementation code.** AI was used for some code needed to test functionality that was too finicky or messy to write before I completely understood the problem space. Currently this consists primarily of parts of the Gmsh loader and some of the periodic boundary-condition handling. Both are provisional and will be substantially rewritten as the library's APIs and requirements settle.
+
+Documentation & comments will always be hand written with AI only used to cleanup the flow. We believe that if we cannot write comments for what the AI code did, its too magic to include (besides temporary logic).

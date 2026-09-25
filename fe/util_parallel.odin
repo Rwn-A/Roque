@@ -86,7 +86,7 @@ narrow_end :: proc(was_narrowed: bool) {
 
 
 // Each rank believes its the only rank in a group, unlike narrow, where only one rank continues.
-// usage: `solo() ... sole_end()`.
+// usage: `solo() ... solo_end()`.
 solo :: proc() -> Rank_Ctx {
 	saved := rank_ctx
 	rank_ctx = Rank_Ctx {
@@ -201,17 +201,17 @@ rank_task_pool_next :: proc(pool: ^Task_Pool) -> (idx: int, ok: bool) {
 Example: hand out variable-cost tasks dynamically (use when tasks outnumber ranks
 and cost varies; use `rank_range` when the work is uniform).
   Job :: struct {
-      tasks:   []Task,
-      results: []Result,
-      pool:    Task_Pool,
+    tasks:   []Task,
+    results: []Result,
+    pool:    Task_Pool,
   }
   process :: proc(job: ^Job) {
-      rank_task_pool_init(&job.pool, len(job.tasks))
-      for {
-          i := rank_task_pool_next(&job.pool) or_break
-          job.results[i] = run_task(job.tasks[i])
-      }
-      rank_sync()
+    rank_task_pool_init(&job.pool, len(job.tasks))
+    for {
+        i := rank_task_pool_next(&job.pool) or_break
+        job.results[i] = run_task(job.tasks[i])
+    }
+    rank_sync()
   }
   widen(process, &job, 8)
 */
@@ -219,9 +219,9 @@ and cost varies; use `rank_range` when the work is uniform).
 //== Widening to multi-rank context.
 
 // Run the provided function in the widened-rank context, calling thread participates as rank 0.
-widen :: proc(entry: proc(data: $T), data: T, rank_count: int) {
-	assert(rank_count > 0)
-	assert(rank_count <= MAX_RANKS, "rank_count exceeds MAX_RANKS")
+widen :: proc(entry: proc(data: $T), data: T, n_ranks: int) {
+	assert(n_ranks > 0)
+	assert(n_ranks <= MAX_RANKS, "rank_count exceeds MAX_RANKS")
 	assert(rank_count() <= 1, "Widening from multiple existing threads is probably a bad idea.")
 
 	scratch_guard()
@@ -238,7 +238,7 @@ widen :: proc(entry: proc(data: $T), data: T, rank_count: int) {
 	}
 
 	// Serial fast path.
-	if rank_count == 1 {
+	if n_ranks == 1 {
 		rank_ctx = Rank_Ctx {
 			idx   = 0,
 			count = 1,
@@ -248,7 +248,7 @@ widen :: proc(entry: proc(data: $T), data: T, rank_count: int) {
 	}
 
 	barrier: sync.Barrier
-	sync.barrier_init(&barrier, rank_count)
+	sync.barrier_init(&barrier, n_ranks)
 
 	shared_ptrs: [MAX_RANKS]rawptr
 
@@ -258,13 +258,13 @@ widen :: proc(entry: proc(data: $T), data: T, rank_count: int) {
 		data:  T,
 	}
 
-	params := make([]Thread_Params, rank_count, scratch())
-	threads := make([]^thread.Thread, rank_count - 1, scratch())
+	params := make([]Thread_Params, n_ranks, scratch())
+	threads := make([]^thread.Thread, n_ranks - 1, scratch())
 
 	// Launch worker ranks
-	for i in 1 ..< rank_count {
+	for i in 1 ..< n_ranks {
 		params[i] = Thread_Params {
-			rank = Rank_Ctx{idx = i, count = rank_count, barrier = &barrier, shared_ptrs = &shared_ptrs},
+			rank = Rank_Ctx{idx = i, count = n_ranks, barrier = &barrier, shared_ptrs = &shared_ptrs},
 			entry = entry,
 			data = data,
 		}
@@ -278,7 +278,7 @@ widen :: proc(entry: proc(data: $T), data: T, rank_count: int) {
 	// Rank 0 runs on the calling thread.
 	rank_ctx = Rank_Ctx {
 		idx         = 0,
-		count       = rank_count,
+		count       = n_ranks,
 		barrier     = &barrier,
 		shared_ptrs = &shared_ptrs,
 	}

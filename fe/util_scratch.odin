@@ -12,7 +12,7 @@ import "base:runtime"
 import "core:mem"
 import "core:mem/virtual"
 
-// TODO: replace with bespoke implementation that doenst have a mutex we dont need thread safety here.
+// TODO: replace with bespoke implementation that doesnt have a mutex we dont need thread safety here.
 
 Scratch_Temp  :: virtual.Arena_Temp
 Scratch_Arena :: virtual.Arena
@@ -20,18 +20,22 @@ Scratch_Arena :: virtual.Arena
 @(thread_local, private)
 _scratch_arena: Scratch_Arena
 
+// Simple scratch allocator, be careful using for dynamic containers.
 scratch :: proc() -> mem.Allocator {
 	return virtual.arena_allocator(scratch_arena())
 }
 
+// Current totally used memory
 scratch_used :: proc() -> uint {
 	return _scratch_arena.total_used
 }
 
+// Begin a temporary region
 scratch_begin_temp :: proc() -> Scratch_Temp {
 	return virtual.arena_temp_begin(scratch_arena())
 }
 
+// End a temporary region
 scratch_end_temp :: proc(temp: Scratch_Temp) {
 	virtual.arena_temp_end(temp)
 }

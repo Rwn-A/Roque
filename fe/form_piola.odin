@@ -29,6 +29,8 @@ tangent_from_nodes :: proc(
 	return {slice.reinterpret([]Small_Mat(A, I, T), p.data), affine}
 }
 
+
+// Tangent map at a point, do not modify without copying.
 tangent_at :: proc(t: Tangent($A, $I, $T), point: int) -> ^Small_Mat(A, I, T) {
 	return &t.maps[0 if t.constant else point]
 }
@@ -38,7 +40,6 @@ tangent_at :: proc(t: Tangent($A, $I, $T), point: int) -> ^Small_Mat(A, I, T) {
 tangent_measure :: proc(tng: Tangent($A, $I, $T), point: int) -> T {
 	return small_mat_measure(tangent_at(tng, point)^)
 }
-
 
 // Covariant transform, for covectors like H1 gradients, H(curl) values.
 Piola_Cov :: struct(A, I: int, T: typeid) {
@@ -55,16 +56,20 @@ Piola_Den :: struct(A, I: int, T: typeid) {
 	tng: Tangent(A, I, T),
 }
 
+// Construct a covariant mapping from `tng` unlike other maps this is not cheap and requires allocation
 piola_covariant :: proc(tng: Tangent($A, $I, $T), alloc := context.allocator) -> Piola_Cov(A, I, T) {
 	maps := make([]Small_Mat(A, I, T), len(tng.maps), alloc)
 	for m, i in tng.maps { maps[i] = small_mat_inv_t(m) }
 	return {maps = {maps, tng.constant}}
 }
 
+// Contravariant piola mapping, a view over `tng`.
 piola_contravariant :: proc(tng: Tangent($A, $I, $T)) -> Piola_Con(A, I, T) {
 	return {tng}
 }
 
+
+// Density map, also just a view over `tng`.
 piola_density :: proc(tng: Tangent($A, $I, $T)) -> Piola_Den(A, I, T) {
 	return {tng}
 }

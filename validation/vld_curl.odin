@@ -78,91 +78,91 @@ assemble_curl_cell :: proc(
 }
 
 //@(test)
-curl_curl :: proc(t: ^testing.T) {
-	arena := virtual.Arena{}
-	virtual.arena_init_growing(&arena) or_else testing.fail_now(t, "unable to create arena")
-	context.allocator = virtual.arena_allocator(&arena)
-	defer virtual.arena_destroy(&arena)
+// curl_curl :: proc(t: ^testing.T) {
+// 	arena := virtual.Arena{}
+// 	virtual.arena_init_growing(&arena) or_else testing.fail_now(t, "unable to create arena")
+// 	context.allocator = virtual.arena_allocator(&arena)
+// 	defer virtual.arena_destroy(&arena)
 
-	//== Mesh and geometry
+// 	//== Mesh and geometry
 
-	mesh := fio.load_mesh("./validation/meshes/2d_channel.msh", .GMSH_V2_BINARY) or_else testing.fail_now(t)
-	defer fe.mesh_destroy(&mesh)
+// 	mesh := fio.load_mesh("./validation/meshes/2d_channel.msh", .GMSH_V2_BINARY) or_else testing.fail_now(t)
+// 	defer fe.mesh_destroy(&mesh)
 
-	geo_space := fe.space_new_isoparemetric(&mesh, 2)
-	geo := fe.Space_Vector{geo_space, fe.mesh_coord_coeffs(mesh, fe.XY_PLANE_FRAME)}
+// 	geo_space := fe.space_new_isoparemetric(&mesh, 2)
+// 	geo := fe.Space_Vector{geo_space, fe.mesh_coord_coeffs(mesh, fe.XY_PLANE_FRAME)}
 
-	//== Space and system: one Nedelec field, no constraints
+// 	//== Space and system: one Nedelec field, no constraints
 
-	e_space := fe.space_new(&mesh, {.Nedelec, .O1, .Continuous, fe.ALL_REGIONS}, 1)
+// 	e_space := fe.space_new(&mesh, {.Nedelec, .O1, .Continuous, fe.ALL_REGIONS}, 1)
 
-	ms := fe.ms_create(.Eliminate, {space = e_space})
-	defer fe.ms_destroy(&ms)
+// 	ms := fe.ms_create(.Eliminate, {space = e_space})
+// 	defer fe.ms_destroy(&ms)
 
-	sys := fe.sys_create(ms, {test = e_space, trial = e_space})
-	defer fe.sys_destroy(&sys)
+// 	sys := fe.sys_create(ms, {test = e_space, trial = e_space})
+// 	defer fe.sys_destroy(&sys)
 
-	state := fe.ms_state_alloc(ms)
-	inhom := fe.ms_state_alloc(ms)
-	rhs, soln := fe.ms_soln_vector(ms), fe.ms_soln_vector(ms)
-	K := fe.sys_soln_matrix(sys)
+// 	state := fe.ms_state_alloc(ms)
+// 	inhom := fe.ms_state_alloc(ms)
+// 	rhs, soln := fe.ms_soln_vector(ms), fe.ms_soln_vector(ms)
+// 	K := fe.sys_soln_matrix(sys)
 
-	//== Assemble and solve
+// 	//== Assemble and solve
 
-	for &cell in mesh.cells {
-		fe.scratch_guard()
-		context.allocator = fe.scratch()
-		assemble_curl_cell(2, 2, sys, geo, e_space, K, rhs, inhom, &cell)
-	}
+// 	for &cell in mesh.cells {
+// 		fe.scratch_guard()
+// 		context.allocator = fe.scratch()
+// 		assemble_curl_cell(2, 2, sys, geo, e_space, K, rhs, inhom, &cell)
+// 	}
 
-	precond := fe.amgcl_precond_create(K, fe.Precond_Params{kind = .ILU0}) or_else testing.fail_now(t)
-	defer fe.amgcl_precond_destroy(precond)
-	log.info(fe.amgcl_solve(precond, rhs, soln, fe.cg_params(max_iters = 700, tolerance = 1e-3)))
+// 	precond := fe.amgcl_precond_create(K, fe.Precond_Params{kind = .ILU0}) or_else testing.fail_now(t)
+// 	defer fe.amgcl_precond_destroy(precond)
+// 	log.info(fe.amgcl_solve(precond, rhs, soln, fe.cg_params(max_iters = 700, tolerance = 1e-3)))
 
-	fe.ms_apply_soln(ms, state, inhom, soln)
+// 	fe.ms_apply_soln(ms, state, inhom, soln)
 
-	//== Check E against g and write both
+// 	//== Check E against g and write both
 
-	writer, out_rules := fio.output_setup(mesh, geo_space, geo.coeffs, .O1, fio.VTU_Config{})
-	defer fio.output_takedown(writer)
+// 	writer, out_rules := fio.output_setup(mesh, geo_space, geo.coeffs, .O1, fio.VTU_Config{})
+// 	defer fio.output_takedown(writer)
 
-	e_out := fio.output_field_create(mesh, "E", 2, out_rules)
-	err_out := fio.output_field_create(mesh, "Error", 1, out_rules) // |E - g|
+// 	e_out := fio.output_field_create(mesh, "E", 2, out_rules)
+// 	err_out := fio.output_field_create(mesh, "Error", 1, out_rules) // |E - g|
 
-	e_vec := fe.ms_space_vec(ms, state, e_space)
-	max_err: f64
+// 	e_vec := fe.ms_space_vec(ms, state, e_space)
+// 	max_err: f64
 
-	for &cell in mesh.cells {
-		fe.scratch_guard()
-		context.allocator = fe.scratch()
-		rule := out_rules[cell.type]
-		n_points := len(rule.points)
+// 	for &cell in mesh.cells {
+// 		fe.scratch_guard()
+// 		context.allocator = fe.scratch()
+// 		rule := out_rules[cell.type]
+// 		n_points := len(rule.points)
 
-		geo_basis := fe.bstore_interior(fe.space_bd(geo_space, cell.type), rule)
-		nodes := fe.space_gather(f64, geo, cell.id)
-		tangent := fe.tangent_from_nodes(2, 2, geo_basis[.S_Grd], nodes, cell.affine)
-		x := fe.pvec_create(f64, n_points, 1, 2)
-		fe.contract_eval(1, 2, x, nodes, geo_basis[.S_Val])
+// 		geo_basis := fe.bstore_interior(fe.space_bd(geo_space, cell.type), rule)
+// 		nodes := fe.space_gather(f64, geo, cell.id)
+// 		tangent := fe.tangent_from_nodes(2, 2, geo_basis[.S_Grd], nodes, cell.affine)
+// 		x := fe.pvec_create(f64, n_points, 1, 2)
+// 		fe.contract_eval(1, 2, x, nodes, geo_basis[.S_Val])
 
-		bd := fe.space_bd(e_space, cell.type)
-		e_ref := fe.bstore_interior(bd, rule)
-		e_val := fe.basis_orient_push(bd, e_ref[.V_Val], fe.cell_entity_keys(&cell), fe.piola_covariant(tangent))
+// 		bd := fe.space_bd(e_space, cell.type)
+// 		e_ref := fe.bstore_interior(bd, rule)
+// 		e_val := fe.basis_orient_push(bd, e_ref[.V_Val], fe.cell_entity_keys(&cell), fe.piola_covariant(tangent))
 
-		e_at := fe.pvec_create(f64, n_points, 2, 1)
-		fe.contract_eval(2, 1, e_at, fe.space_gather(f64, e_vec, cell.id), e_val)
-		copy(e_out.data[cell.id], e_at.data)
+// 		e_at := fe.pvec_create(f64, n_points, 2, 1)
+// 		fe.contract_eval(2, 1, e_at, fe.space_gather(f64, e_vec, cell.id), e_val)
+// 		copy(e_out.data[cell.id], e_at.data)
 
-		for p in 0 ..< n_points {
-			e := fe.pvec_at_point(e_at, p).data
-			g := exact_field(fe.pvec_at_point(x, p).data)
-			err := math.sqrt((e[0] - g.x) * (e[0] - g.x) + (e[1] - g.y) * (e[1] - g.y))
-			err_out.data[cell.id][p] = err
-			max_err = max(max_err, err)
-		}
-	}
+// 		for p in 0 ..< n_points {
+// 			e := fe.pvec_at_point(e_at, p).data
+// 			g := exact_field(fe.pvec_at_point(x, p).data)
+// 			err := math.sqrt((e[0] - g.x) * (e[0] - g.x) + (e[1] - g.y) * (e[1] - g.y))
+// 			err_out.data[cell.id][p] = err
+// 			max_err = max(max_err, err)
+// 		}
+// 	}
 
-	log.info("max |E - g| =", max_err)
-	testing.expect(t, max_err < 1e-8, "Nedelec O1 should reproduce a linear field exactly")
+// 	log.info("max |E - g| =", max_err)
+// 	testing.expect(t, max_err < 1e-8, "Nedelec O1 should reproduce a linear field exactly")
 
-	fio.output_write(writer, {fields = {e_out, err_out}, path = "./validation/output/curl_curl"})
-}
+// 	fio.output_write(writer, {fields = {e_out, err_out}, path = "./validation/output/curl_curl"})
+// }

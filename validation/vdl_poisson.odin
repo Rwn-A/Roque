@@ -156,11 +156,11 @@ mixed_poisson :: proc(t: ^testing.T) {
 
 	// Every block the weak form touches. The u-u block is empty, but declaring it keeps a diagonal for the solver.
 	sys := fe.sys_create(
-		ms,
-		{test = sigma_space, trial = sigma_space},
-		{test = u_space, trial = sigma_space},
-		{test = sigma_space, trial = u_space},
-		// no u-u saddle point
+	ms,
+	{test = sigma_space, trial = sigma_space},
+	{test = u_space, trial = sigma_space},
+	{test = sigma_space, trial = u_space},
+	// no u-u saddle point
 	)
 	defer fe.sys_destroy(&sys)
 
@@ -185,10 +185,12 @@ mixed_poisson :: proc(t: ^testing.T) {
 
 	//== Solve
 
-	precond := fe.amgcl_precond_create(K, fe.Precond_Params{kind = .ILU0}) or_else testing.fail_now(t)
+	precond := fe.amgcl_precond_create(K, fe.relaxation_params(.ILU0)) or_else testing.fail_now(t, string(fe.amgcl_last_error()))
 	defer fe.amgcl_precond_destroy(precond)
-	fe.amgcl_precond_print(precond)
-	log.info(fe.amgcl_solve(precond, rhs, soln, fe.bicgstab_params(max_iters = 700, tolerance = 1e-6)))
+
+	res := fe.amgcl_solve(precond, rhs, soln, fe.bicgstab_params(tol = 1e-12, maxiter = 700))
+	log.info(res)
+	testing.expect(t, res.status == .Converged)
 
 	fe.ms_apply_soln(ms, state, inhom, soln)
 
@@ -235,17 +237,22 @@ mixed_poisson :: proc(t: ^testing.T) {
 		copy(sigma_out.data[cell.id], sigma_at.data)
 
 		// div sigma = div_ref / det J: oriented, then the density Piola map.
-		sigma_div := fe.basis_orient_push(sigma_bd, sigma_ref[.V_Div], fe.cell_entity_keys(&cell), fe.piola_density(tangent))
+		sigma_div := fe.basis_orient_push(
+			sigma_bd,
+			sigma_ref[.V_Div],
+			fe.cell_entity_keys(&cell),
+			fe.piola_density(tangent),
+		)
 		div_at := fe.pvec_create(f64, n_points, 1, 1)
 		fe.contract_eval(1, 1, div_at, sigma_coeffs, sigma_div)
 		copy(div_out.data[cell.id], div_at.data)
 	}
 
-	max: f64 =  0
+	max: f64 = 0
 	min: f64 = 10000
-	for e in div_out.data{
-		if abs(slice.max(e)) > max {max = abs(slice.max(e))}
-		if abs(slice.min(e)) < min {min = abs(slice.min(e))}
+	for e in div_out.data {
+		if abs(slice.max(e)) > max { max = abs(slice.max(e)) }
+		if abs(slice.min(e)) < min { min = abs(slice.min(e)) }
 	}
 	log.info(max, min)
 
@@ -294,7 +301,13 @@ Spaces :: struct {
 }
 
 // Volume terms of one cell.
-assemble_cell_hdg :: proc(c: ^fe.Condenser, geo: fe.Space_Vector, s: Spaces, cell: ^fe.Cell, diffusivity, source: f64) {
+assemble_cell_hdg :: proc(
+	c: ^fe.Condenser,
+	geo: fe.Space_Vector,
+	s: Spaces,
+	cell: ^fe.Cell,
+	diffusivity, source: f64,
+) {
 	u_bd := fe.space_bd(s.u, cell.type)
 	quad, weights := fe.basis_quad_rule(u_bd)
 	n_points := len(quad.points)
@@ -404,14 +417,17 @@ hdg_poisson :: proc(t: ^testing.T) {
 			fe.space_new(&mesh, {.Lagrange, ORDER, .Discontinuous, fe.ALL_REGIONS}, 1),
 		},
 		u   = fe.space_new(&mesh, {.Lagrange, ORDER, .Discontinuous, fe.ALL_REGIONS}, 1),
-		lam = fe.space_new(&mesh, {.Lagrange, ORDER, .Discontinuous, fe.ALL_REGIONS}, 1, .Facet),
+		lam = fe.space_new(&mesh, {.Lagrange, ORDER, .Continuous, fe.ALL_REGIONS}, 1, .Facet),
 	}
 
 	cond := fe.cond_create(&mesh, {s.q[0], s.q[1], s.u}, {s.lam})
 	defer fe.cond_destroy(&cond)
 
 	// Only lambda is solved for. u_D on every boundary facet, as an essential constraint on lambda.
-	ms := fe.ms_create(.Eliminate, {space = s.lam, constraints = {fe.Constraint_Essential{boundaries = ~fe.Boundary_Set{}}}})
+	ms := fe.ms_create(
+		.Eliminate,
+		{space = s.lam, constraints = {fe.Constraint_Essential{boundaries = ~fe.Boundary_Set{}}}},
+	)
 	defer fe.ms_destroy(&ms)
 
 	// Condensation couples every pair of facets of a cell.
@@ -445,9 +461,12 @@ hdg_poisson :: proc(t: ^testing.T) {
 
 	//== Solve for lambda, then recover q and u
 
-	precond := fe.amgcl_precond_create(K, fe.Precond_Params{kind = .ILU0}) or_else testing.fail_now(t)
+	precond := fe.amgcl_precond_create(K, fe.relaxation_params(.ILUK)) or_else testing.fail_now(t, string(fe.amgcl_last_error()))
 	defer fe.amgcl_precond_destroy(precond)
-	log.info(fe.amgcl_solve(precond, rhs, soln, fe.bicgstab_params(max_iters = 700, tolerance = 1e-12)))
+
+	res := fe.amgcl_solve(precond, rhs, soln, fe.cg_params(tol = 1e-8, maxiter = 700))
+	log.info(res)
+	testing.expect(t, res.status == .Converged)
 
 	fe.ms_apply_soln(ms, state, inhom, soln)
 

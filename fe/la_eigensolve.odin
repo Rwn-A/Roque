@@ -24,14 +24,15 @@ Lanczos_Result :: struct {
 // `subspace_dim` size of the Krylov basis to build, increase for more eigen pairs but at higher cost.
 // `shift` shifts the eigensolve to a particualr region, choose closest to your frequencies of interest.
 // returned eigen values & vectors are in order lowest to highest. Frequency is divided out by 2pi.
+// `precond_params` / `solver_params`: nil uses `lanczos_precond_params` / `lanczos_solver_params`.
 inexact_shift_lanczos :: proc(
 	K, M: Sparse_Matrix,
 	subspace_dim: int,
 	eigen_values: []f64,
 	eigen_vectors: []Vector,
 	shift: f64 = 0.0,
-	precond_params: Precond_Params = SA_DEFAULT,
-	solver_params: Solver_Params = CG_DEFAULT,
+	precond_params: Maybe(Precond_Params) = nil,
+	solver_params: Maybe(Solver_Params) = nil,
 ) -> Lanczos_Result {
 	LANCZOS_BREAKDOWN_TOL :: 1e-25
 	ORTHO_PASSES :: 2
@@ -47,6 +48,11 @@ inexact_shift_lanczos :: proc(
 	context.allocator = scratch()
 
 	N := sp_n_rows(K.sp)
+	assert(len(K.values) == len(M.values), "K and M must share a sparsity pattern")
+
+	precond_prm := precond_params.? or_else lanczos_precond_params()
+	solver_prm := solver_params.? or_else lanczos_solver_params()
+
 	subspace_dim := subspace_dim
 	if subspace_dim > N { subspace_dim = N }
 
@@ -72,7 +78,7 @@ inexact_shift_lanczos :: proc(
 		}
 	}
 
-	precond, ok := amgcl_precond_create(K_shifted, precond_params)
+	precond, ok := amgcl_precond_create(K_shifted, precond_prm)
 	if !ok { return Lanczos_Result{status = .Preconditioner_Failed} }
 	defer amgcl_precond_destroy(precond)
 
@@ -87,7 +93,7 @@ inexact_shift_lanczos :: proc(
 
 		sp_gemv(M, V[j], q)
 
-		if amgcl_result := amgcl_solve(precond, q, z, solver_params); amgcl_result.status != .Converged {
+		if amgcl_result := amgcl_solve(precond, q, z, solver_prm); amgcl_result.status != .Converged {
 			status = .Linear_Solve_Failed; actual_m -= 1
 			break
 		}
@@ -240,5 +246,21 @@ inexact_shift_lanczos :: proc(
 			if ratio < 0.0 { count += 1 }
 		}
 		return count
+	}
+
+	lanczos_precond_params :: proc() -> (p: Precond_Params) {
+		amgcl_precond_params_default(&p)
+		p.class = .AMG
+		p.amg.coarsening.kind = .Smoothed_Aggregation
+		p.amg.relax.kind = .Gauss_Seidel
+		return
+	}
+
+	lanczos_solver_params :: proc() -> (p: Solver_Params) {
+		amgcl_solver_params_default(&p)
+		p.kind = .BiCGStab
+		p.tol = 1e-8
+		p.maxiter = 500
+		return
 	}
 }

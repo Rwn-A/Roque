@@ -1,9 +1,7 @@
 package fe
 
 /*
- Bindings for the AMGCL library (more specifically bindings to our C wrapper of it).
-
- These bindings are temporary and will be expanded to support more features of AMGCL.
+ Bindings for our AMGCL C wrapper.
 */
 
 import "core:c"
@@ -24,141 +22,220 @@ when ODIN_OS == .Linux {
 	@(require) foreign import libstdcpp "system:stdc++"
 }
 
-Precond :: struct {}
-
-Precond_Kind :: enum c.int {
-	SA    = 0,
-	ILU0  = 1,
-	SCHUR = 2,
+Amgcl_Status :: enum c.int {
+	Ok            = 0,
+	Not_Converged = 1,
+	Error         = -1,
 }
 
-Solver_Kind :: enum c.int {
-	CG       = 0,
-	BICGSTAB = 1,
-	FGMRES   = 2,
+//== relaxation
+
+Relax_Type :: enum c.int {
+	Gauss_Seidel,
+	ILU0,
+	ILU0_Chow_Patel,
+	ILUK,
+	ILUP,
+	ILUT,
+	Damped_Jacobi,
+	SPAI0,
+	SPAI1,
+	Chebyshev,
 }
 
-Relax_Kind :: enum c.int {
-	GAUSS_SEIDEL = 0,
-	ILU0         = 1,
-	SPAI0        = 2,
+ILU_Solve :: struct {
+	serial: b32,
 }
 
-SA_Extra :: struct {
-	block_size:           c.int,
-	coarse_enough:        c.int,
-	relax:                Relax_Kind,
-	near_null_space:      [^]c.double,
-	near_null_space_cols: c.int,
-}
-
-ILU0_Extra :: struct {
-	_reserved: c.int,
-}
-
-// Schur complement pressure-correction preconditioner
-Schur_Extra :: struct {
-	pmask:         [^]c.char,
-	variant:       c.int,
-	approx_schur:  c.bool,
-	usolver_relax: Relax_Kind,
-	adjust_p:      bool,
-}
-
-Precond_Extra :: struct #raw_union {
-	sa:    SA_Extra,
-	ilu0:  ILU0_Extra,
-	schur: Schur_Extra,
-}
-
-Precond_Params :: struct {
-	kind:  Precond_Kind,
-	extra: Precond_Extra,
-}
-
-Solver_Common_Params :: struct {
-	tolerance: c.double,
-	max_iters: c.int,
-	verbose:   c.int,
-}
-
-CG_Extra :: struct {
-	_reserved: c.int,
-}
-
-BiCGStab_Extra :: struct {
-	_reserved: c.int,
-}
-
-FGMRES_Extra :: struct {
-	gmres_m: c.int,
-}
-
-Solver_Extra :: struct #raw_union {
-	cg:       CG_Extra,
-	bicgstab: BiCGStab_Extra,
-	fgmres:   FGMRES_Extra,
-}
-
-Solver_Params :: struct {
-	kind:   Solver_Kind,
-	common: Solver_Common_Params,
-	extra:  Solver_Extra,
-}
-
-@(default_calling_convention = "c", link_prefix = "amgcl")
-foreign amgcl_lib {
-	_precond_params_default :: proc(kind: Precond_Kind, out: ^Precond_Params) ---
-	_solver_params_default :: proc(kind: Solver_Kind, out: ^Solver_Params) ---
-	_precond_create :: proc(n: c.int, row_ptr: [^]c.int, col_ind: [^]c.int, values: [^]c.double, p: ^Precond_Params) -> ^Precond ---
-	_precond_destroy :: proc(p: ^Precond) ---
-	_precond_print :: proc(p: ^Precond) ---
-	@(link_name = "amgcl_solve")
-	solve_raw :: proc(p: ^Precond, rhs: [^]c.double, x: [^]c.double, sp: ^Solver_Params, out_iters: ^c.int, out_residual: ^c.double) -> c.int ---
-}
-
-SA_DEFAULT := Precond_Params {
-	kind = .SA,
-	extra = {
-		sa = {
-			block_size = 1,
-			coarse_enough = 50,
-			relax = .GAUSS_SEIDEL,
-			near_null_space = nil,
-			near_null_space_cols = 0,
-		},
+Relax_Params :: struct {
+	kind:            Relax_Type,
+	gauss_seidel:    struct {
+		serial: b32,
+	},
+	ilu0:            struct {
+		damping: f64,
+		solve:   ILU_Solve,
+	},
+	ilu0_chow_patel: struct {
+		damping:           f64,
+		sweeps:            c.int,
+		omega:             f64,
+		symmetric_scaling: b32,
+		solve:             ILU_Solve,
+	},
+	iluk:            struct {
+		k:       c.int,
+		damping: f64,
+		solve:   ILU_Solve,
+	},
+	ilup:            struct {
+		k:       c.int,
+		damping: f64,
+		solve:   ILU_Solve,
+	},
+	ilut:            struct {
+		p, tau, damping: f64,
+		solve:           ILU_Solve,
+	},
+	damped_jacobi:   struct {
+		damping: f64,
+	},
+	chebyshev:       struct {
+		degree:        c.uint,
+		higher, lower: f32,
+		power_iters:   c.int,
+		scale:         b32,
 	},
 }
 
-ILU0_DEFAULT := Precond_Params {
-	kind = .ILU0,
-	extra = {ilu0 = {}},
+//== coarsening
+
+Coarsening_Type :: enum c.int {
+	Ruge_Stuben,
+	Aggregation,
+	Smoothed_Aggregation,
+	Smoothed_Aggr_Emin,
 }
 
-SCHUR_DEFAULT := Precond_Params {
-	kind = .SCHUR,
-	extra = {schur = {pmask = nil, variant = 1, approx_schur = false, usolver_relax = .ILU0, adjust_p = true}},
+Coarsening_Params :: struct {
+	kind:                 Coarsening_Type,
+	ruge_stuben:          struct {
+		eps_strong: f32,
+		do_trunc:   b32,
+		eps_trunc:  f32,
+	},
+	// Shared by the three aggregation coarsenings.
+	aggr:                 struct {
+		block_size:     c.uint,
+		eps_strong:     f32,
+		nullspace:      [^]f64,
+		nullspace_cols: c.int,
+	},
+	aggregation:          struct {
+		over_interp: f32,
+	},
+	smoothed_aggregation: struct {
+		relax:                    f32,
+		estimate_spectral_radius: b32,
+		power_iters:              c.int,
+	},
 }
 
-CG_DEFAULT := Solver_Params {
-	kind = .CG,
-	common = {tolerance = 1e-8, max_iters = 500, verbose = 0},
-	extra = {cg = {}},
+//== preconditioner
+
+Precond_Class :: enum c.int {
+	AMG,
+	Relaxation,
+	Dummy,
+	Shell,
 }
 
-BICGSTAB_DEFAULT := Solver_Params {
-	kind = .BICGSTAB,
-	common = {tolerance = 1e-8, max_iters = 500, verbose = 0},
-	extra = {bicgstab = {}},
+AMG_Params :: struct {
+	coarsening:    Coarsening_Params,
+	relax:         Relax_Params,
+	coarse_enough: c.uint,
+	direct_coarse: b32,
+	max_levels:    c.uint,
+	npre, npost:   c.uint,
+	ncycle:        c.uint,
+	pre_cycles:    c.uint,
 }
 
-FGMRES_DEFAULT := Solver_Params {
-	kind = .FGMRES,
-	common = {tolerance = 1e-8, max_iters = 500, verbose = 0},
-	extra = {fgmres = {gmres_m = 30}},
+// x = M^-1 rhs. Overwrite all of x, return 0 on success; anything else aborts
+Shell_Apply :: #type proc "c" (ctx: rawptr, n: c.int, rhs: [^]f64, x: [^]f64) -> c.int
+
+Precond_Params :: struct {
+	class:      Precond_Class,
+	amg:        AMG_Params,
+	relaxation: Relax_Params,
+	shell:      struct {
+		apply: Shell_Apply,
+		ctx:   rawptr, // passed through untouched; must outlive the preconditioner
+	},
 }
 
-// wrapper
+//== Krylov solver
+
+Solver_Type :: enum c.int {
+	CG,
+	BiCGStab,
+	BiCGStabL,
+	GMRES,
+	LGMRES,
+	FGMRES,
+	IDRS,
+	Richardson,
+	Preonly,
+}
+
+Solver_Params :: struct {
+	kind:       Solver_Type,
+	// Common to every kind except Preonly.
+	tol:        f64,
+	abstol:     f64,
+	maxiter:    c.uint,
+	ns_search:  b32,
+	verbose:    b32,
+	bicgstab:   struct {
+		check_after: b32,
+	},
+	bicgstabl:  struct {
+		L:      c.int,
+		delta:  f64,
+		convex: b32,
+	},
+	gmres:      struct {
+		M: c.uint,
+	},
+	lgmres:     struct {
+		M, K:         c.uint,
+		always_reset: b32,
+	},
+	fgmres:     struct {
+		M: c.uint,
+	},
+	idrs:       struct {
+		s:                      c.uint,
+		omega:                  f64,
+		smoothing, replacement: b32,
+	},
+	richardson: struct {
+		damping: f64,
+	},
+}
+
+Conv_Info :: struct {
+	iterations: c.int,
+	residual:   f64,
+}
+
+Precond :: struct {} // opaque
+
+@(default_calling_convention = "c")
+foreign amgcl_lib {
+	@(link_name = "amgcl_precond_params_default")
+	amgcl_precond_params_default :: proc(out: ^Precond_Params) ---
+	@(link_name = "amgcl_solver_params_default")
+	amgcl_solver_params_default :: proc(out: ^Solver_Params) ---
+	@(link_name = "amgcl_last_error")
+	amgcl_last_error :: proc() -> cstring ---
+	@(link_name = "amgcl_precond_create")
+	_precond_create :: proc(n: c.int, row_ptr, col_ind: [^]c.int, values: [^]f64, prm: ^Precond_Params) -> ^Precond ---
+	@(link_name = "amgcl_precond_destroy")
+	_precond_destroy :: proc(p: ^Precond) ---
+	@(link_name = "amgcl_precond_apply")
+	_precond_apply :: proc(p: ^Precond, rhs, x: [^]f64) -> Amgcl_Status ---
+	@(link_name = "amgcl_precond_print")
+	_precond_print :: proc(p: ^Precond) ---
+	@(link_name = "amgcl_precond_size")
+	amgcl_precond_size :: proc(p: ^Precond) -> c.int ---
+	@(link_name = "amgcl_solve")
+	_solve :: proc(p: ^Precond, rhs, x: [^]f64, sp: ^Solver_Params, info: ^Conv_Info) -> Amgcl_Status ---
+	@(link_name = "amgcl_solve_with")
+	_solve_with :: proc(p: ^Precond, row_ptr, col_ind: [^]c.int, values: [^]f64, rhs, x: [^]f64, sp: ^Solver_Params, info: ^Conv_Info) -> Amgcl_Status ---
+}
+
+//== wrapper
 
 Solve_Status :: enum {
 	Converged,
@@ -172,112 +249,187 @@ Solve_Result :: struct {
 	residual: f64,
 }
 
-sa_params :: proc(
-	block_size := 1,
-	coarse_enough := 50,
-	relax := Relax_Kind.GAUSS_SEIDEL,
-	near_null_space: []f64 = nil,
-	near_null_space_cols := 0,
-) -> Precond_Params {
-	p := SA_DEFAULT
-	p.extra.sa.block_size = clamp(c.int(block_size), 1, 4)
-	p.extra.sa.coarse_enough = c.int(coarse_enough)
-	p.extra.sa.relax = relax
-	if len(near_null_space) > 0 {
-		p.extra.sa.near_null_space = cast([^]c.double)raw_data(near_null_space)
-		p.extra.sa.near_null_space_cols = c.int(near_null_space_cols)
-	}
-	return p
-}
-
-// pmask: length n, matching the dof ordering of the matrix passed to
-// amgcl_precond_create. 1 marks a "pressure" (zero-block) dof, 0 marks a
-// "flow" dof.
-schur_params :: proc(
-	pmask: []u8,
-	variant := 1,
-	approx_schur := false,
-	usolver_relax := Relax_Kind.ILU0,
-	adjust_p := true,
-) -> Precond_Params {
-	p := SCHUR_DEFAULT
-	assert(len(pmask) > 0, "schur_params requires a non-empty pmask")
-	p.extra.schur.pmask = cast([^]c.char)raw_data(pmask)
-	p.extra.schur.variant = c.int(variant)
-	p.extra.schur.approx_schur = c.bool(approx_schur)
-	p.extra.schur.usolver_relax = usolver_relax
-	return p
-}
-
-cg_params :: proc(tolerance := 1e-8, max_iters := 500, verbose := false) -> Solver_Params {
-	p := CG_DEFAULT
-	p.common = {c.double(tolerance), c.int(max_iters), c.int(verbose)}
-	return p
-}
-
-bicgstab_params :: proc(tolerance := 1e-8, max_iters := 500, verbose := false) -> Solver_Params {
-	p := BICGSTAB_DEFAULT
-	p.common = {c.double(tolerance), c.int(max_iters), c.int(verbose)}
-	return p
-}
-
-fgmres_params :: proc(tolerance := 1e-8, max_iters := 500, gmres_m := 30, verbose := false) -> Solver_Params {
-	p := FGMRES_DEFAULT
-	p.common = {c.double(tolerance), c.int(max_iters), c.int(verbose)}
-	p.extra.fgmres.gmres_m = c.int(gmres_m)
-	return p
-}
-
-// Creates the preconditioner for the given matrix.
-amgcl_precond_create :: proc(
-	m: Sparse_Matrix,
-	params: Precond_Params = SA_DEFAULT,
-) -> (
-	precond: ^Precond,
-	success: bool,
-) {
+@(private = "file")
+check_csr :: proc(m: Sparse_Matrix) -> int {
 	n := sp_n_rows(m)
 	assert(n > 0, "row_ptrs must have at least 2 entries")
 	assert(len(m.columns) == int(m.row_ptrs[n]), "columns length must match row_ptrs[n]")
 	assert(len(m.values) == len(m.columns), "values length must match columns length")
-	p := params
-	if p.kind == .SA && p.extra.sa.near_null_space != nil {
-		assert(p.extra.sa.near_null_space_cols > 0, "near_null_space was set but near_null_space_cols is 0.")
-	}
-	if p.kind == .SCHUR {
-		assert(p.extra.schur.pmask != nil, "schur precond requires pmask to be set (use schur_params)")
-	}
-	precond = _precond_create(
-		c.int(n),
-		cast([^]c.int)raw_data(m.row_ptrs),
-		cast([^]c.int)raw_data(m.columns),
-		cast([^]c.double)raw_data(m.values),
-		&p,
-	)
-	success = precond != nil
-	return
+	return n
 }
 
+@(private = "file")
+to_result :: proc(st: Amgcl_Status, info: Conv_Info) -> Solve_Result {
+	status: Solve_Status
+	switch st {
+	case .Ok: status = .Converged
+	case .Not_Converged: status = .Not_Converged
+	case .Error: status = .Error
+	case: unreachable()
+	}
+	return {status = status, iters = int(info.iterations), residual = info.residual}
+}
+
+// Builds the preconditioner.
+amgcl_precond_create :: proc(
+	m: Sparse_Matrix,
+	params: Maybe(Precond_Params) = nil,
+) -> (
+	precond: ^Precond,
+	success: bool,
+) {
+	n := check_csr(m)
+	p: Precond_Params
+	if v, ok := params.?; ok { p = v } else { amgcl_precond_params_default(&p) }
+	nsp := p.amg.coarsening.aggr
+	assert(nsp.nullspace == nil || nsp.nullspace_cols > 0, "nullspace set but nullspace_cols is 0")
+	assert(p.class != .Shell || p.shell.apply != nil, "shell preconditioner needs an apply proc")
+	precond = _precond_create(c.int(n), raw_data(m.row_ptrs), raw_data(m.columns), raw_data(m.values), &p)
+	return precond, precond != nil
+}
+
+// Free preconditioner
 amgcl_precond_destroy :: proc(p: ^Precond) {
 	_precond_destroy(p)
 }
 
+// Print preconditioner info from amgcl
 amgcl_precond_print :: proc(p: ^Precond) {
 	_precond_print(p)
 }
 
-// Solve the system using the preconditioner.
-amgcl_solve :: proc(p: ^Precond, rhs, x: Vector, params: Solver_Params = CG_DEFAULT) -> Solve_Result {
-	assert(len(rhs) == len(x), "rhs and x must be the same length")
-	sp := params
-	iters: c.int
-	residual: c.double
-	rc := solve_raw(p, cast([^]c.double)raw_data(rhs), cast([^]c.double)raw_data(x), &sp, &iters, &residual)
-	status: Solve_Status
-	switch rc {
-	case 0: status = .Converged
-	case 1: status = .Not_Converged
-	case: status = .Error
+// x = M^-1 rhs
+amgcl_precond_apply :: proc(p: ^Precond, rhs, x: Vector) -> bool {
+	assert(len(rhs) == len(x) && len(x) == int(amgcl_precond_size(p)))
+	return _precond_apply(p, raw_data(rhs), raw_data(x)) == .Ok
+}
+
+// Solve with the matrix the preconditioner was built from. x is the initial guess.
+amgcl_solve :: proc(p: ^Precond, rhs, x: Vector, params: Maybe(Solver_Params) = nil) -> Solve_Result {
+	assert(len(rhs) == len(x) && len(x) == int(amgcl_precond_size(p)), "rhs and x must match the system size")
+	sp: Solver_Params
+	if v, ok := params.?; ok { sp = v } else { amgcl_solver_params_default(&sp) }
+	info: Conv_Info
+	st := _solve(p, raw_data(rhs), raw_data(x), &sp, &info)
+	return to_result(st, info)
+}
+
+// Solve with a different (same-size) matrix, reusing the preconditioner.
+amgcl_solve_with :: proc(
+	p: ^Precond,
+	m: Sparse_Matrix,
+	rhs, x: Vector,
+	params: Maybe(Solver_Params) = nil,
+) -> Solve_Result {
+	n := check_csr(m)
+	assert(n == int(amgcl_precond_size(p)), "matrix size must match the preconditioner")
+	assert(len(rhs) == n && len(x) == n, "rhs and x must match the system size")
+	sp: Solver_Params
+	if v, ok := params.?; ok { sp = v } else { amgcl_solver_params_default(&sp) }
+	info: Conv_Info
+	st := _solve_with(
+		p,
+		raw_data(m.row_ptrs),
+		raw_data(m.columns),
+		raw_data(m.values),
+		raw_data(rhs),
+		raw_data(x),
+		&sp,
+		&info,
+	)
+	return to_result(st, info)
+}
+
+//== preconditioner helpers
+
+amg_params :: proc(
+	relax := Relax_Type.SPAI0,
+	coarsening := Coarsening_Type.Smoothed_Aggregation,
+	block_size := 1,
+	nullspace: []f64 = nil,
+	nullspace_cols := 0,
+) -> (
+	p: Precond_Params,
+) {
+	amgcl_precond_params_default(&p)
+	p.class = .AMG
+	p.amg.relax.kind = relax
+	p.amg.coarsening.kind = coarsening
+	p.amg.coarsening.aggr.block_size = c.uint(block_size)
+	if len(nullspace) > 0 {
+		assert(
+			nullspace_cols > 0 && len(nullspace) % nullspace_cols == 0,
+			"nullspace length must be n * nullspace_cols",
+		)
+		p.amg.coarsening.aggr.nullspace = raw_data(nullspace)
+		p.amg.coarsening.aggr.nullspace_cols = c.int(nullspace_cols)
 	}
-	return Solve_Result{status = status, iters = int(iters), residual = f64(residual)}
+	return
+}
+
+// Single-level relaxation (ILU0, ILUT, SPAI0, ...) used directly as the preconditioner.
+relaxation_params :: proc(kind := Relax_Type.ILU0) -> (p: Precond_Params) {
+	amgcl_precond_params_default(&p)
+	p.class = .Relaxation
+	p.relaxation.kind = kind
+	return
+}
+
+// No preconditioning.
+identity_params :: proc() -> (p: Precond_Params) {
+	amgcl_precond_params_default(&p)
+	p.class = .Dummy
+	return
+}
+
+// User preconditioner, e.g. a field split.
+shell_params :: proc(apply: Shell_Apply, ctx: rawptr) -> (p: Precond_Params) {
+	amgcl_precond_params_default(&p)
+	p.class = .Shell
+	p.shell.apply = apply
+	p.shell.ctx = ctx
+	return
+}
+
+//== solver helpers
+
+solver_params :: proc(
+	kind := Solver_Type.BiCGStab,
+	tol := 1e-8,
+	maxiter := 500,
+	verbose := false,
+) -> (
+	p: Solver_Params,
+) {
+	amgcl_solver_params_default(&p)
+	p.kind = kind
+	p.tol = tol
+	p.maxiter = c.uint(maxiter)
+	p.verbose = b32(verbose)
+	return
+}
+
+cg_params :: proc(tol := 1e-8, maxiter := 500, verbose := false) -> Solver_Params {
+	return solver_params(.CG, tol, maxiter, verbose)
+}
+
+bicgstab_params :: proc(tol := 1e-8, maxiter := 500, verbose := false) -> Solver_Params {
+	return solver_params(.BiCGStab, tol, maxiter, verbose)
+}
+
+gmres_params :: proc(tol := 1e-8, maxiter := 500, restart := 30, verbose := false) -> Solver_Params {
+	p := solver_params(.GMRES, tol, maxiter, verbose)
+	p.gmres.M = c.uint(restart)
+	return p
+}
+
+fgmres_params :: proc(tol := 1e-8, maxiter := 500, restart := 30, verbose := false) -> Solver_Params {
+	p := solver_params(.FGMRES, tol, maxiter, verbose)
+	p.fgmres.M = c.uint(restart)
+	return p
+}
+
+// Apply the preconditioner once, no iteration.
+preonly_params :: proc() -> Solver_Params {
+	return solver_params(.Preonly)
 }

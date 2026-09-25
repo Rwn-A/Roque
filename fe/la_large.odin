@@ -20,7 +20,7 @@ Sparse_Matrix :: struct {
 // CSR sparsity pattern
 Sparsity :: struct {
 	row_ptrs: []i32,
-	columns:  []i32,
+	columns:  []i32, // should be sorted per row
 }
 
 // Column-major
@@ -64,6 +64,7 @@ sp_get :: proc(sm: Sparse_Matrix, #any_int row, col: i32) -> ^f64 {
 	return &sm.values[int(sm.row_ptrs[row]) + idx]
 }
 
+// Number of rows in the matrix, size of compatible vector.
 sp_n_rows :: proc(sp: Sparsity) -> int {
 	return len(sp.row_ptrs) - 1
 }
@@ -72,6 +73,7 @@ sp_n_rows :: proc(sp: Sparsity) -> int {
 
 // a . b
 vec_dot :: proc(a, b: Vector) -> f64 {
+	assert(len(a) == len(b))
 	s: f64 = 0
 	for i in 0 ..< len(a) { s += a[i] * b[i] }
 	return s
