@@ -127,7 +127,6 @@ Precond_Class :: enum c.int {
 	AMG,
 	Relaxation,
 	Dummy,
-	Shell,
 }
 
 AMG_Params :: struct {
@@ -141,17 +140,20 @@ AMG_Params :: struct {
 	pre_cycles:    c.uint,
 }
 
-// x = M^-1 rhs. Overwrite all of x, return 0 on success; anything else aborts
-Shell_Apply :: #type proc "c" (ctx: rawptr, n: c.int, rhs: [^]f64, x: [^]f64) -> c.int
-
 Precond_Params :: struct {
 	class:      Precond_Class,
 	amg:        AMG_Params,
 	relaxation: Relax_Params,
-	shell:      struct {
-		apply: Shell_Apply,
-		ctx:   rawptr, // passed through untouched; must outlive the preconditioner
-	},
+}
+
+//== shell
+
+// y = Op(x): y = M^-1 x as a preconditioner, y = A x as an operator.
+Shell_Apply :: #type proc "c" (ctx: rawptr, n: c.int, x: [^]f64, y: [^]f64) -> c.int
+
+Shell :: struct {
+	apply: Shell_Apply,
+	ctx:   rawptr,
 }
 
 //== Krylov solver
@@ -221,6 +223,8 @@ foreign amgcl_lib {
 	amgcl_last_error :: proc() -> cstring ---
 	@(link_name = "amgcl_precond_create")
 	_precond_create :: proc(n: c.int, row_ptr, col_ind: [^]c.int, values: [^]f64, prm: ^Precond_Params) -> ^Precond ---
+	@(link_name = "amgcl_precond_create_shell")
+	_precond_create_shell :: proc(n: c.int, apply: Shell_Apply, ctx: rawptr) -> ^Precond ---
 	@(link_name = "amgcl_precond_destroy")
 	_precond_destroy :: proc(p: ^Precond) ---
 	@(link_name = "amgcl_precond_apply")
@@ -233,9 +237,27 @@ foreign amgcl_lib {
 	_solve :: proc(p: ^Precond, rhs, x: [^]f64, sp: ^Solver_Params, info: ^Conv_Info) -> Amgcl_Status ---
 	@(link_name = "amgcl_solve_with")
 	_solve_with :: proc(p: ^Precond, row_ptr, col_ind: [^]c.int, values: [^]f64, rhs, x: [^]f64, sp: ^Solver_Params, info: ^Conv_Info) -> Amgcl_Status ---
+	@(link_name = "amgcl_solve_op")
+	_solve_op :: proc(p: ^Precond, op_apply: Shell_Apply, op_ctx: rawptr, rhs, x: [^]f64, sp: ^Solver_Params, info: ^Conv_Info) -> Amgcl_Status ---
 }
 
 //== wrapper
+
+// amgcl's own defaults
+PRECOND_DEFAULT := precond_defaults()
+SOLVER_DEFAULT := solver_defaults()
+
+@(private = "file")
+precond_defaults :: proc "c" () -> (p: Precond_Params) {
+	amgcl_precond_params_default(&p)
+	return
+}
+
+@(private = "file")
+solver_defaults :: proc "c" () -> (p: Solver_Params) {
+	amgcl_solver_params_default(&p)
+	return
+}
 
 Solve_Status :: enum {
 	Converged,
@@ -271,20 +293,20 @@ to_result :: proc(st: Amgcl_Status, info: Conv_Info) -> Solve_Result {
 }
 
 // Builds the preconditioner.
-amgcl_precond_create :: proc(
-	m: Sparse_Matrix,
-	params: Maybe(Precond_Params) = nil,
-) -> (
-	precond: ^Precond,
-	success: bool,
-) {
+amgcl_precond_create :: proc(m: Sparse_Matrix, params := PRECOND_DEFAULT) -> (precond: ^Precond, success: bool) {
 	n := check_csr(m)
-	p: Precond_Params
-	if v, ok := params.?; ok { p = v } else { amgcl_precond_params_default(&p) }
+	p := params
 	nsp := p.amg.coarsening.aggr
 	assert(nsp.nullspace == nil || nsp.nullspace_cols > 0, "nullspace set but nullspace_cols is 0")
-	assert(p.class != .Shell || p.shell.apply != nil, "shell preconditioner needs an apply proc")
 	precond = _precond_create(c.int(n), raw_data(m.row_ptrs), raw_data(m.columns), raw_data(m.values), &p)
+	return precond, precond != nil
+}
+
+// Preconditioner implemented by a shell, e.g. a field split.
+amgcl_precond_create_shell :: proc(n: int, shell: Shell) -> (precond: ^Precond, success: bool) {
+	assert(n > 0)
+	assert(shell.apply != nil, "shell needs an apply proc")
+	precond = _precond_create_shell(c.int(n), shell.apply, shell.ctx)
 	return precond, precond != nil
 }
 
@@ -305,27 +327,21 @@ amgcl_precond_apply :: proc(p: ^Precond, rhs, x: Vector) -> bool {
 }
 
 // Solve with the matrix the preconditioner was built from. x is the initial guess.
-amgcl_solve :: proc(p: ^Precond, rhs, x: Vector, params: Maybe(Solver_Params) = nil) -> Solve_Result {
+// Errors for a shell preconditioner.
+amgcl_solve :: proc(p: ^Precond, rhs, x: Vector, params := SOLVER_DEFAULT) -> Solve_Result {
 	assert(len(rhs) == len(x) && len(x) == int(amgcl_precond_size(p)), "rhs and x must match the system size")
-	sp: Solver_Params
-	if v, ok := params.?; ok { sp = v } else { amgcl_solver_params_default(&sp) }
+	sp := params
 	info: Conv_Info
 	st := _solve(p, raw_data(rhs), raw_data(x), &sp, &info)
 	return to_result(st, info)
 }
 
 // Solve with a different (same-size) matrix, reusing the preconditioner.
-amgcl_solve_with :: proc(
-	p: ^Precond,
-	m: Sparse_Matrix,
-	rhs, x: Vector,
-	params: Maybe(Solver_Params) = nil,
-) -> Solve_Result {
+amgcl_solve_with :: proc(p: ^Precond, m: Sparse_Matrix, rhs, x: Vector, params := SOLVER_DEFAULT) -> Solve_Result {
 	n := check_csr(m)
 	assert(n == int(amgcl_precond_size(p)), "matrix size must match the preconditioner")
 	assert(len(rhs) == n && len(x) == n, "rhs and x must match the system size")
-	sp: Solver_Params
-	if v, ok := params.?; ok { sp = v } else { amgcl_solver_params_default(&sp) }
+	sp := params
 	info: Conv_Info
 	st := _solve_with(
 		p,
@@ -340,6 +356,16 @@ amgcl_solve_with :: proc(
 	return to_result(st, info)
 }
 
+// Solve with an operator shell, op computes y = A x (e.g. over block CSRs).
+amgcl_solve_op :: proc(p: ^Precond, op: Shell, rhs, x: Vector, params := SOLVER_DEFAULT) -> Solve_Result {
+	assert(op.apply != nil, "operator shell needs an apply proc")
+	assert(len(rhs) == len(x) && len(x) == int(amgcl_precond_size(p)), "rhs and x must match the system size")
+	sp := params
+	info: Conv_Info
+	st := _solve_op(p, op.apply, op.ctx, raw_data(rhs), raw_data(x), &sp, &info)
+	return to_result(st, info)
+}
+
 //== preconditioner helpers
 
 amg_params :: proc(
@@ -351,7 +377,7 @@ amg_params :: proc(
 ) -> (
 	p: Precond_Params,
 ) {
-	amgcl_precond_params_default(&p)
+	p = PRECOND_DEFAULT
 	p.class = .AMG
 	p.amg.relax.kind = relax
 	p.amg.coarsening.kind = coarsening
@@ -369,7 +395,7 @@ amg_params :: proc(
 
 // Single-level relaxation (ILU0, ILUT, SPAI0, ...) used directly as the preconditioner.
 relaxation_params :: proc(kind := Relax_Type.ILU0) -> (p: Precond_Params) {
-	amgcl_precond_params_default(&p)
+	p = PRECOND_DEFAULT
 	p.class = .Relaxation
 	p.relaxation.kind = kind
 	return
@@ -377,17 +403,8 @@ relaxation_params :: proc(kind := Relax_Type.ILU0) -> (p: Precond_Params) {
 
 // No preconditioning.
 identity_params :: proc() -> (p: Precond_Params) {
-	amgcl_precond_params_default(&p)
+	p = PRECOND_DEFAULT
 	p.class = .Dummy
-	return
-}
-
-// User preconditioner, e.g. a field split.
-shell_params :: proc(apply: Shell_Apply, ctx: rawptr) -> (p: Precond_Params) {
-	amgcl_precond_params_default(&p)
-	p.class = .Shell
-	p.shell.apply = apply
-	p.shell.ctx = ctx
 	return
 }
 
@@ -401,7 +418,7 @@ solver_params :: proc(
 ) -> (
 	p: Solver_Params,
 ) {
-	amgcl_solver_params_default(&p)
+	p = SOLVER_DEFAULT
 	p.kind = kind
 	p.tol = tol
 	p.maxiter = c.uint(maxiter)

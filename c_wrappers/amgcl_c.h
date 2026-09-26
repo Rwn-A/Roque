@@ -10,9 +10,11 @@
  * wrapper per axis. Instantiations grow with the SUM of options on each axis,
  * never the product, and all of amgcl's options on each axis are available.
  *
- * Block and field-split preconditioners are implemented outside the binding
- * through the SHELL preconditioner class (a C callback), with amgcl solving
- * the blocks.
+ * Anything the binding doesn't provide is supplied as a shell: a C callback
+ * computing y = Op(x). A shell can be the preconditioner
+ * (amgcl_precond_create_shell), the system operator (amgcl_solve_op), or
+ * both. Field splits and matrix-free operators are built this way, with
+ * amgcl solving the blocks.
  *
  * Usage: build a preconditioner once with amgcl_precond_create, then call
  * amgcl_solve as often as needed, choosing the Krylov solver per call.
@@ -117,30 +119,7 @@ typedef enum {
     AMGCL_PRECOND_AMG,         /* multilevel: coarsening + relax           */
     AMGCL_PRECOND_RELAXATION,  /* single-level: `relaxation` applied as M^-1 */
     AMGCL_PRECOND_DUMMY,       /* identity (unpreconditioned Krylov)       */
-    AMGCL_PRECOND_SHELL,       /* user callback, see amgcl_shell_apply_fn  */
 } amgcl_precond_class_t;
-
-/* User-implemented preconditioner: compute x = M^-1 rhs.
- *
- * This is the building block for field-split / block preconditioners written
- * outside the binding: extract the blocks yourself, build an amgcl solver per
- * block with amgcl_precond_create, and combine them in the callback using
- * amgcl_precond_apply (one cycle) or amgcl_solve (inner iterations).
- *
- * Contract:
- *  - n is the size of the system; rhs and x have n entries.
- *  - Overwrite all of x. Its contents on entry are unspecified.
- *  - Return 0 on success. Any other value aborts the solve: amgcl_solve
- *    returns AMGCL_ERROR and amgcl_last_error() reports the value.
- *  - Called on the thread that called amgcl_solve, once or more per
- *    Krylov iteration. Calling into other amgcl solver handles from inside the
- *    callback is fine; calling into the handle currently being solved is not.
- *  - The callback must not unwind (no C++ exceptions, longjmp or panics
- *    escaping into amgcl). Report failure through the return value.
- *  - The Krylov method sees a preconditioner that may not be a fixed linear
- *    operator (inner iterations, AMG cycles); use FGMRES unless you know the
- *    callback is linear, and CG only if it is also symmetric positive definite. */
-typedef int (*amgcl_shell_apply_fn)(void *ctx, int n, const double *rhs, double *x);
 
 typedef struct {
     amgcl_coarsening_params_t coarsening;
@@ -157,11 +136,27 @@ typedef struct {
     amgcl_precond_class_t cls;
     amgcl_amg_params_t    amg;         /* used when cls == AMGCL_PRECOND_AMG */
     amgcl_relax_params_t  relaxation;  /* used when cls == AMGCL_PRECOND_RELAXATION */
-    struct {
-        amgcl_shell_apply_fn apply;
-        void                *ctx;      /* passed through untouched; must outlive the solver */
-    } shell;                           /* used when cls == AMGCL_PRECOND_SHELL */
 } amgcl_precond_params_t;
+
+/* ---- shells ------------------------------------------------------------ */
+
+/* y = Op(x), where Op is a preconditioner (y = M^-1 x) or a system operator
+ * (y = A x) depending on where the shell is used.
+ *
+ * Contract:
+ *  - x and y have n entries and never alias. Overwrite all of y; its contents
+ *    on entry are unspecified.
+ *  - Return 0 on success. Any other value aborts the solve: it returns
+ *    AMGCL_ERROR and amgcl_last_error() reports the value.
+ *  - Called on the thread that called amgcl_solve*, one or more times per
+ *    Krylov iteration. Using other amgcl handles from inside is fine; using
+ *    the one currently being solved is not.
+ *  - Must not unwind (no C++ exceptions, longjmp or panics escaping into
+ *    amgcl). Report failure through the return value.
+ *  - A preconditioner shell with inner iterations or AMG cycles isn't a fixed
+ *    linear operator: use FGMRES unless you know it is linear, and CG only if
+ *    it is also symmetric positive definite. */
+typedef int (*amgcl_shell_apply_fn)(void *ctx, int n, const double *x, double *y);
 
 /* ---- Krylov solver ---------------------------------------------------- */
 
@@ -230,8 +225,13 @@ amgcl_precond_t *amgcl_precond_create(int n, const int *row_ptr, const int *col_
                                       const double *values, const amgcl_precond_params_t *prm);
 void             amgcl_precond_destroy(amgcl_precond_t *p);
 
+/* Preconditioner implemented by a callback. It has no system matrix, so solve
+ * with amgcl_solve_op or amgcl_solve_with. ctx is passed through untouched
+ * and must outlive the preconditioner. */
+amgcl_precond_t *amgcl_precond_create_shell(int n, amgcl_shell_apply_fn apply, void *ctx);
+
 /* x = M^-1 rhs, one application of the preconditioner. This is what block
- * solvers inside a SHELL field split call. */
+ * solvers inside a field split call. */
 amgcl_status_t amgcl_precond_apply(const amgcl_precond_t *p, const double *rhs, double *x);
 
 /* Print the preconditioner hierarchy to stdout. */
@@ -241,7 +241,8 @@ int amgcl_precond_size(const amgcl_precond_t *p);
 
 /* ---- solving ---------------------------------------------------------- */
 
-/* Solve A x = rhs with the matrix the preconditioner was built from.
+/* Solve A x = rhs with the matrix the preconditioner was built from (an error
+ * for a shell preconditioner, which has none).
  * x is the initial guess on entry and the solution on exit. sp may be NULL for
  * the defaults; info may be NULL. The same preconditioner can be used for any
  * number of solves, with different solver settings each time. */
@@ -255,6 +256,14 @@ amgcl_status_t amgcl_solve_with(const amgcl_precond_t *p,
                                 const int *row_ptr, const int *col_ind, const double *values,
                                 const double *rhs, double *x,
                                 const amgcl_solver_params_t *sp, amgcl_conv_info_t *info);
+
+/* Solve with a matrix-free operator: A x computed by op_apply (y = A x), which
+ * must be the same size as the preconditioner. ctx only needs to live for the
+ * duration of the call. */
+amgcl_status_t amgcl_solve_op(const amgcl_precond_t *p,
+                              amgcl_shell_apply_fn op_apply, void *op_ctx,
+                              const double *rhs, double *x,
+                              const amgcl_solver_params_t *sp, amgcl_conv_info_t *info);
 
 #ifdef __cplusplus
 }

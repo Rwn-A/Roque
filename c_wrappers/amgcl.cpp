@@ -179,59 +179,101 @@ struct any_coarsening {
 };
 
 //===========================================================================
-// Shell preconditioner: x = M^-1 rhs computed by a user C callback. Keeps its
-// own copy of the system matrix, which the Krylov solver needs for spmv.
+// Shells: y = Op(x) computed by a user C callback. Used as a preconditioner
+// (shell_precond) or as the system operator (shell_matrix).
 //===========================================================================
 
-template <class B>
-struct shell_precond {
-    using backend_type   = B;
-    using value_type     = typename B::value_type;
-    using matrix         = typename B::matrix;
-    using vector         = typename B::vector;
-    using backend_params = typename B::params;
-    using build_matrix   = typename amgcl::backend::builtin<value_type>::matrix;
+struct shell {
+    amgcl_shell_apply_fn apply = nullptr;
+    void                *ctx   = nullptr;
+    std::size_t          n     = 0;
 
-    struct params {
-        amgcl_shell_apply_fn apply = nullptr;
-        void                *ctx   = nullptr;
-    };
-
-    std::shared_ptr<matrix> A;
-    params prm;
-
-    template <class Matrix>
-    shell_precond(const Matrix &M, const params &p, const backend_params &bp)
-        : A(B::copy_matrix(std::make_shared<build_matrix>(M), bp)), prm(p)
-    {
-        if (!prm.apply) throw std::invalid_argument("shell preconditioner has no apply callback");
+    shell(amgcl_shell_apply_fn apply, void *ctx, std::size_t n) : apply(apply), ctx(ctx), n(n) {
+        if (!apply) throw std::invalid_argument("shell has no apply callback");
     }
 
-    // Krylov solvers call this with backend vectors (numa_vector for builtin);
-    // amgcl_precond_apply calls it with iterator ranges. Both are
-    // contiguous and indexable, so &v[0] is the raw pointer in either case.
-    template <class V1, class V2>
-    void apply(const V1 &rhs, V2 &x) const {
-        const std::size_t n = amgcl::backend::rows(*A);
+    void operator()(const double *x, double *y) const {
         if (n == 0) return;
-        int rc = prm.apply(prm.ctx, static_cast<int>(n), &rhs[0], &x[0]);
-        if (rc != 0)
-            throw std::runtime_error("shell preconditioner callback returned " + std::to_string(rc));
-    }
-
-    std::shared_ptr<matrix> system_matrix_ptr() const { return A; }
-    const matrix &system_matrix() const { return *A; }
-    std::size_t bytes() const { return amgcl::backend::bytes(*A); }
-
-    friend std::ostream &operator<<(std::ostream &os, const shell_precond &p) {
-        return os << "Shell preconditioner (user callback)\n"
-                  << "  Unknowns: " << amgcl::backend::rows(*p.A) << "\n"
-                  << "  Nonzeros: " << amgcl::backend::nonzeros(*p.A) << "\n";
+        int rc = apply(ctx, static_cast<int>(n), x, y);
+        if (rc != 0) throw std::runtime_error("shell callback returned " + std::to_string(rc));
     }
 };
 
+template <class B>
+struct shell_precond {
+    using matrix = typename B::matrix;
+
+    shell op;
+    mutable std::vector<double> in;  // copy of rhs when the caller aliases rhs and x
+
+    // Krylov solvers pass backend vectors (numa_vector), amgcl_precond_apply
+    // passes iterator ranges; both are contiguous, so &v[0] is the data.
+    template <class V1, class V2>
+    void apply(const V1 &rhs, V2 &x) const {
+        if (op.n == 0) return;
+        const double *r = &rhs[0];
+        if (r == &x[0]) {
+            in.assign(r, r + op.n);
+            r = in.data();
+        }
+        op(r, &x[0]);
+    }
+
+    std::shared_ptr<matrix> system_matrix_ptr() const { return nullptr; }
+    std::size_t bytes() const { return 0; }
+
+    friend std::ostream &operator<<(std::ostream &os, const shell_precond &p) {
+        return os << "Shell preconditioner (user callback)\n  Unknowns: " << p.op.n << "\n";
+    }
+};
+
+// Matrix-free system operator. Krylov solvers only reach the matrix through
+// backend::spmv and backend::residual, specialized for this type below.
+struct shell_matrix {
+    using value_type = double;  // amgcl's dispatch inspects it
+    shell op;
+    mutable std::vector<double> Ax;  // one operator per solve, so no sharing
+};
+
+} // namespace amgcl_c
+
+namespace amgcl {
+namespace backend {
+
+// y = alpha A x + beta y
+template <class Alpha, class V1, class Beta, class V2>
+struct spmv_impl<Alpha, amgcl_c::shell_matrix, V1, Beta, V2> {
+    static void apply(Alpha alpha, const amgcl_c::shell_matrix &A, const V1 &x, Beta beta, V2 &y) {
+        const std::size_t n = A.op.n;
+        A.Ax.resize(n);
+        A.op(&x[0], A.Ax.data());
+        if (math::is_zero(beta)) {
+            for (std::size_t i = 0; i < n; ++i) y[i] = alpha * A.Ax[i];
+        } else {
+            for (std::size_t i = 0; i < n; ++i) y[i] = alpha * A.Ax[i] + beta * y[i];
+        }
+    }
+};
+
+// r = rhs - A x
+template <class V1, class V2, class V3>
+struct residual_impl<amgcl_c::shell_matrix, V1, V2, V3> {
+    static void apply(const V1 &rhs, const amgcl_c::shell_matrix &A, const V2 &x, V3 &r) {
+        const std::size_t n = A.op.n;
+        A.Ax.resize(n);
+        A.op(&x[0], A.Ax.data());
+        for (std::size_t i = 0; i < n; ++i) r[i] = rhs[i] - A.Ax[i];
+    }
+};
+
+} // namespace backend
+} // namespace amgcl
+
+namespace amgcl_c {
+
 //===========================================================================
-// Preconditioner class. Order matches amgcl_precond_class_t.
+// Preconditioner. Built alternatives follow amgcl_precond_class_t; a shell
+// is created separately since it has no matrix.
 //===========================================================================
 
 template <class B>
@@ -239,8 +281,7 @@ struct any_precond {
     using C = choice<
         amgcl::amg<B, any_coarsening, any_relax>,
         amgcl::relaxation::as_preconditioner<B, any_relax>,
-        amgcl::preconditioner::dummy<B>,
-        shell_precond<B>>;
+        amgcl::preconditioner::dummy<B>>;
 
     using backend_type   = B;
     using value_type     = typename B::value_type;
@@ -249,25 +290,34 @@ struct any_precond {
     using backend_params = typename B::params;
     using params         = typename C::params;
 
-    typename C::handle h;
+    using handle = std::variant<
+        std::unique_ptr<amgcl::amg<B, any_coarsening, any_relax>>,
+        std::unique_ptr<amgcl::relaxation::as_preconditioner<B, any_relax>>,
+        std::unique_ptr<amgcl::preconditioner::dummy<B>>,
+        std::unique_ptr<shell_precond<B>>>;
+
+    handle h;
 
     template <class Matrix>
     any_precond(const Matrix &A, const params &p = params(),
                 const backend_params &bp = backend_params())
-        : h(C::build("preconditioner class", p.type, [&](auto I) {
-              using T = typename C::template at<decltype(I)::value>;
-              return std::make_unique<T>(A, std::get<decltype(I)::value>(p.of), bp);
-          })) {}
+        : h(std::visit([](auto &&ptr) { return handle(std::move(ptr)); },
+                       C::build("preconditioner class", p.type, [&](auto I) {
+                           using T = typename C::template at<decltype(I)::value>;
+                           return std::make_unique<T>(A, std::get<decltype(I)::value>(p.of), bp);
+                       }))) {}
+
+    explicit any_precond(shell op)
+        : h(std::make_unique<shell_precond<B>>(shell_precond<B>{op, {}})) {}
 
     template <class V1, class V2>
     void apply(const V1 &rhs, V2 &x) const {
         visit_ptr(h, [&](auto &P) { P.apply(rhs, x); });
     }
+    // nullptr for a shell.
     std::shared_ptr<matrix> system_matrix_ptr() const {
-        return visit_ptr(h, [](auto &P) { return P.system_matrix_ptr(); });
+        return visit_ptr(h, [](auto &P) { return std::shared_ptr<matrix>(P.system_matrix_ptr()); });
     }
-    const matrix &system_matrix() const { return *system_matrix_ptr(); }
-    std::size_t size() const { return amgcl::backend::rows(system_matrix()); }
     std::size_t bytes() const {
         return visit_ptr(h, [](auto &P) { return amgcl::backend::bytes(P); });
     }
@@ -467,10 +517,6 @@ void map_precond(bool to_c, amgcl_precond_params_t &c, Precond::params &p, std::
     x (to_c, c.amg.pre_cycles, a.pre_cycles);
 
     map_relax(to_c, c.relaxation, std::get<1>(p.of));
-
-    auto &sh = std::get<3>(p.of);
-    if (to_c) { c.shell.apply = nullptr; c.shell.ctx = nullptr; }
-    else      { sh.apply = c.shell.apply; sh.ctx = c.shell.ctx; }
 }
 
 // Every Krylov params struct except preonly's has these five fields.
@@ -657,6 +703,23 @@ amgcl_precond_t *amgcl_precond_create(int n, const int *row_ptr, const int *col_
     return result;
 }
 
+amgcl_precond_t *amgcl_precond_create_shell(int n, amgcl_shell_apply_fn apply, void *ctx) {
+    if (n <= 0) {
+        last_error = "invalid argument: need n > 0";
+        return nullptr;
+    }
+    amgcl_precond *result = nullptr;
+    guarded([&] {
+        const std::size_t N = static_cast<std::size_t>(n);
+        auto h = std::make_unique<amgcl_precond>();
+        h->n = N;
+        h->P = std::make_unique<Precond>(shell(apply, ctx, N));
+        result = h.release();
+        return AMGCL_OK;
+    });
+    return result;
+}
+
 void amgcl_precond_destroy(amgcl_precond_t *p) { delete p; }
 
 amgcl_status_t amgcl_precond_apply(const amgcl_precond_t *p, const double *rhs, double *x) {
@@ -678,7 +741,11 @@ int amgcl_precond_size(const amgcl_precond_t *p) { return p ? static_cast<int>(p
 amgcl_status_t amgcl_solve(const amgcl_precond_t *p, const double *rhs, double *x,
                            const amgcl_solver_params_t *sp, amgcl_conv_info_t *info) {
     if (bad_args(p, rhs, x)) return AMGCL_ERROR;
-    return guarded([&] { return run_solve(p, p->P->system_matrix(), rhs, x, sp, info); });
+    return guarded([&] {
+        auto A = p->P->system_matrix_ptr();
+        if (!A) throw std::invalid_argument("shell preconditioner has no matrix: use amgcl_solve_op or amgcl_solve_with");
+        return run_solve(p, *A, rhs, x, sp, info);
+    });
 }
 
 amgcl_status_t amgcl_solve_with(const amgcl_precond_t *p,
@@ -690,6 +757,17 @@ amgcl_status_t amgcl_solve_with(const amgcl_precond_t *p,
     return guarded([&] {
         // The builtin backend's Krylov kernels want its own CSR type.
         Backend::matrix A(csr_tuple(p->n, row_ptr, col_ind, values));
+        return run_solve(p, A, rhs, x, sp, info);
+    });
+}
+
+amgcl_status_t amgcl_solve_op(const amgcl_precond_t *p,
+                              amgcl_shell_apply_fn op_apply, void *op_ctx,
+                              const double *rhs, double *x,
+                              const amgcl_solver_params_t *sp, amgcl_conv_info_t *info) {
+    if (bad_args(p, rhs, x)) return AMGCL_ERROR;
+    return guarded([&] {
+        shell_matrix A{shell(op_apply, op_ctx, p->n), {}};
         return run_solve(p, A, rhs, x, sp, info);
     });
 }
