@@ -20,9 +20,6 @@ import fe "../"
 GMSH_EXPECTED_MSH_VERSION :: "2.2 1 8"
 
 @(private = "file")
-ALIGNMENT_TOLERANCE :: 1e-12
-
-@(private = "file")
 Gmsh_Element_Type :: enum {
 	MSH_LINE_2     = 1,
 	MSH_LINE_3     = 8,
@@ -175,13 +172,7 @@ gmsh_load_mesh :: proc(mesh_data: []u8, mesh: ^fe.Mesh) -> bool {
 		expect_ascii_line(&p, "$EndMeshFormat") or_return
 	}
 
-	mesh.boundary_names = make(map[string]fe.Boundary_ID)
-	mesh.region_names = make(map[string]fe.Region_ID)
-
-	names := make(map[string]struct {
-			id:  int,
-			dim: fe.Dimension,
-		}, context.temp_allocator)
+	for &names in mesh.tag_names { names = make(map[string]fe.Tag_ID) }
 
 	{
 		expect_ascii_line(&p, "$PhysicalNames") or_return
@@ -197,20 +188,17 @@ gmsh_load_mesh :: proc(mesh_data: []u8, mesh: ^fe.Mesh) -> bool {
 			group_dim := parse_int(components[0]) or_return
 			if group_dim > max_dimension { max_dimension = group_dim }
 
+			id := parse_int(components[1]) or_return
+			if id >= fe.MAX_TAGS {
+				log.errorf("Gmsh: physical group id %d, ids must be < %d", id, fe.MAX_TAGS)
+				return false
+			}
 			name := strings.clone(strings.trim(components[2], "\""))
-			names[name] = {parse_int(components[1]) or_return, fe.Dimension(group_dim)}
+			mesh.tag_names[fe.Dimension(group_dim)][name] = fe.Tag_ID(id)
 		}
 		expect_ascii_line(&p, "$EndPhysicalNames") or_return
 
 		mesh.intrinsic_dim = fe.Dimension(max_dimension)
-
-		for key, value in names {
-			if value.dim < mesh.intrinsic_dim {
-				mesh.boundary_names[key] = fe.Boundary_ID(value.id)
-			} else {
-				mesh.region_names[key] = fe.Region_ID(value.id)
-			}
-		}
 	}
 
 	gmsh_id_to_node_id := make(map[i32]int, context.temp_allocator)
@@ -233,7 +221,8 @@ gmsh_load_mesh :: proc(mesh_data: []u8, mesh: ^fe.Mesh) -> bool {
 	}
 
 	raw_primary_elements := make([dynamic]Raw_Element, context.temp_allocator)
-	raw_boundary_elements := make([dynamic]Raw_Element, context.temp_allocator)
+	raw_facet_elements := make([dynamic]Raw_Element, context.temp_allocator)
+	skipped := 0
 	{
 		expect_ascii_line(&p, "$Elements") or_return
 		num_elements := parse_int(ascii_line(&p) or_return) or_return
@@ -266,15 +255,13 @@ gmsh_load_mesh :: proc(mesh_data: []u8, mesh: ^fe.Mesh) -> bool {
 				element.type = type
 				_ = read_number(i32, &p) or_return //id
 
-				if num_tags == 0 {
-					if el_dim < mesh.intrinsic_dim { log.warn("Untagged boundary element, defaulting to id 0") }
-					element.tags = make([]i32, 1, context.temp_allocator)
-					element.tags[0] = 0
-				} else {
-					element.tags = make([]i32, num_tags, context.temp_allocator)
-					for j in 0 ..< len(element.tags) {
-						element.tags[j] = read_number(i32, &p) or_return
-					}
+				element.tags = make([]i32, max(int(num_tags), 1), context.temp_allocator) // [physical, elementary], 0 = none
+				for j in 0 ..< int(num_tags) {
+					element.tags[j] = read_number(i32, &p) or_return
+				}
+				if element.tags[0] < 0 || int(element.tags[0]) >= fe.MAX_TAGS {
+					log.errorf("Gmsh: physical group id %d, ids must be < %d", element.tags[0], fe.MAX_TAGS)
+					return false
 				}
 
 				node_count := GMSH_ELEMENT_NUM_NODES[type]
@@ -286,22 +273,17 @@ gmsh_load_mesh :: proc(mesh_data: []u8, mesh: ^fe.Mesh) -> bool {
 					element.node_indices[j] = node_id
 				}
 
-				#partial switch el_dim {
-				case fe.Dimension(int(mesh.intrinsic_dim) - 1): append(&raw_boundary_elements, element)
-				case mesh.intrinsic_dim:
+				switch {
+				case el_dim == mesh.intrinsic_dim:
 					append(&raw_primary_elements, element)
 					mesh.encountered_cell_types += {fem_type}
-				case:
-					log.errorf(
-						"Gmsh: Found a mesh element dim %v that was inconsistent with the dimensions of the mesh %v.",
-						el_dim,
-						mesh.intrinsic_dim,
-					)
-					return false
+				case int(el_dim) == int(mesh.intrinsic_dim) - 1: append(&raw_facet_elements, element)
+				case: skipped += 1
 				}
 			}
 		}
 	}
+	if skipped > 0 { log.warnf("Gmsh: skipped %d elements below facet dimension, they can't be tagged", skipped) }
 
 	parser_consume(&p) or_return // newline after last binary element data
 	expect_ascii_line(&p, "$EndElements") or_return
@@ -405,7 +387,7 @@ gmsh_load_mesh :: proc(mesh_data: []u8, mesh: ^fe.Mesh) -> bool {
 		}
 	}
 
-	return gmsh_build_topology(mesh, raw_primary_elements[:], raw_boundary_elements[:], raw_periodic_links[:])
+	return gmsh_build_topology(mesh, raw_primary_elements[:], raw_facet_elements[:], raw_periodic_links[:])
 }
 
 //== Gmsh node order -> reference node order
@@ -457,30 +439,13 @@ gmsh_ref_nodes :: proc(type: Gmsh_Element_Type) -> []fe.Ref_Vec {
 	unreachable()
 }
 
-// Reference coordinates of the Lagrange nodes of (et, order), in local dof order.
-@(private = "file")
-ref_node_coords :: proc(et: fe.Element_Type, order: fe.Order, alloc := context.allocator) -> []fe.Ref_Vec {
-	bd := fe.Basis_Desc{et, .Lagrange, order}
-	out := make([dynamic]fe.Ref_Vec, alloc)
-	for d in fe.Dimension {
-		if d > fe.element_dim(et) { break }
-		if fe.basis_dofs_per_entity(bd, d) == 0 { continue }
-		for e in 0 ..< fe.element_num_sub_entities(et, d) {
-			for p in fe.basis_entity_functionals(bd, d, e).rule.points {
-				append(&out, fe.element_lift_to_parent_reference(et, d, e, p))
-			}
-		}
-	}
-	return out[:]
-}
-
 // perm[reference local node] = gmsh local node. Cached per gmsh type.
 @(private = "file")
 node_perm :: proc(cache: ^map[Gmsh_Element_Type][]int, type: Gmsh_Element_Type) -> (perm: []int, ok: bool) {
 	if p, found := cache[type]; found { return p, true }
 
 	et, order := gmsh_type_to_element_info(type)
-	ref := ref_node_coords(et, order, context.temp_allocator)
+	ref := fe.basis_nodal_coords({et, .Lagrange, order}, context.temp_allocator)
 	gmsh := gmsh_ref_nodes(type)
 	if len(ref) != len(gmsh) {
 		log.errorf("Gmsh: %v has %d nodes, reference element expects %d", type, len(gmsh), len(ref))
@@ -506,36 +471,34 @@ node_perm :: proc(cache: ^map[Gmsh_Element_Type][]int, type: Gmsh_Element_Type) 
 //== Topology
 
 @(private = "file")
-Facet_Key :: [4]int
+Vertex_Key :: [fe.MAX_VERTICES]int
 
 @(private = "file")
-NO_VERT :: max(int)
-
-@(private = "file")
-facet_key :: proc(ids: []$T) -> Facet_Key {
-	key := Facet_Key{NO_VERT, NO_VERT, NO_VERT, NO_VERT}
+vertex_key :: proc(ids: []$T) -> (key: Vertex_Key) {
+	slice.fill(key[:], max(int))
 	for v, i in ids { key[i] = int(v) }
 	slice.sort(key[:len(ids)])
-	return key
+	return
 }
 
 // Edges or faces, deduplicated by vertex set.
 @(private = "file")
 Entity_Table :: struct {
-	ids:       map[Facet_Key]fe.Entity_ID,
-	canonical: [dynamic][]fe.Entity_ID, // vertex ids in the order the first cell to reach the entity saw them
+	ids:       map[Vertex_Key]fe.Entity_ID,
+	canonical: [dynamic][]fe.Entity_ID, // vertex ids in canonical order
 	types:     [dynamic]fe.Element_Type,
 }
 
 @(private = "file")
-entity_lookup :: proc(t: ^Entity_Table, et: fe.Element_Type, verts: []fe.Entity_ID) -> (id: fe.Entity_ID, canonical: []fe.Entity_ID) {
-	key := facet_key(verts)
-	if existing, ok := t.ids[key]; ok { return existing, t.canonical[existing] }
-	id = fe.Entity_ID(len(t.canonical))
+entity_lookup :: proc(t: ^Entity_Table, et: fe.Element_Type, verts: []fe.Entity_ID) -> fe.Entity_ID {
+	key := vertex_key(verts)
+	if id, ok := t.ids[key]; ok { return id }
+	id := fe.Entity_ID(len(t.canonical))
+	canon := fe.element_canonical_order(et, verts)
 	t.ids[key] = id
-	append(&t.canonical, slice.clone(verts, context.temp_allocator))
+	append(&t.canonical, slice.clone(canon[:len(verts)], context.temp_allocator))
 	append(&t.types, et)
-	return id, t.canonical[id]
+	return id
 }
 
 @(private = "file")
@@ -545,61 +508,38 @@ Topology :: struct {
 	tables:         [fe.Dimension]Entity_Table, // dims 1 ..< cell dim
 }
 
-// Facet id from any node list whose first entries are its vertices (a gmsh boundary element).
+// Ids and keys of an entity's edges and faces from its vertex ids, adding new ones to the tables.
 @(private = "file")
-find_facet :: proc(topo: ^Topology, type: fe.Element_Type, node_indices: []int) -> (id: fe.Entity_ID, ok: bool) {
-	nv := fe.element_num_sub_entities(type, .D0)
-	verts: [4]fe.Entity_ID
-	for i in 0 ..< nv { verts[i] = topo.vertex_of_node[node_indices[i]] or_return }
-	if topo.fd == .D0 { return verts[0], true }
-	return topo.tables[topo.fd].ids[facet_key(verts[:nv])]
-}
-
-// Canonical vertex ids of a facet.
-@(private = "file")
-facet_canon :: proc(topo: ^Topology, f: fe.Entity_ID, buf: ^[1]fe.Entity_ID) -> []fe.Entity_ID {
-	if topo.fd == .D0 {
-		buf[0] = f
-		return buf[:]
-	}
-	return topo.tables[topo.fd].canonical[f]
-}
-
-// Vertices are affine iff every node sits at the affine map of its reference position.
-@(private = "file")
-is_affine :: proc(et: fe.Element_Type, order: fe.Order, nodes: []fe.Entity_ID, coords: [][3]f64) -> bool {
-	if et == .Point { return true }
-	ref := ref_node_coords(et, order, context.temp_allocator)
-
-	// Axis vertices: those differing from vertex 0 in exactly one reference coordinate.
-	x0, r0 := coords[nodes[0]], ref[0]
-	J: [3][3]f64 // columns
-	for a in 0 ..< int(fe.element_dim(et)) {
-		for j in 1 ..< fe.element_num_sub_entities(et, .D0) {
-			dr := ref[j] - r0
-			single := true
-			for b in 0 ..< 3 { if b != a && abs(dr[b]) > 1e-12 { single = false } }
-			if single && abs(dr[a]) > 1e-12 {
-				J[a] = (coords[nodes[j]] - x0) / dr[a]
-				break
-			}
+set_sub_entities :: proc(topo: ^Topology, e: ^fe.Entity) {
+	for d in fe.Dimension {
+		if d == .D0 || d >= fe.element_dim(e.type) { continue }
+		e.conn[d] = make([]fe.Entity_ID, fe.element_n_sub_entities(e.type, d))
+		for &id, k in e.conn[d] {
+			sub := fe.element_sub_entity(e.type, d, k)
+			verts: [fe.MAX_VERTICES]fe.Entity_ID
+			n := len(sub.closure[.D0])
+			for v, i in sub.closure[.D0] { verts[i] = e.conn[.D0][v] }
+			id = entity_lookup(&topo.tables[d], sub.type, verts[:n])
+			e.keys[d][k] = fe.element_orientation(sub.type, verts[:n], topo.tables[d].canonical[id][:])
 		}
 	}
+}
 
-	for r, i in ref {
-		dr := r - r0
-		x := x0 + J[0] * dr[0] + J[1] * dr[1] + J[2] * dr[2]
-		diff := x - coords[nodes[i]]
-		for k in 0 ..< 3 { if abs(diff[k]) > ALIGNMENT_TOLERANCE { return false } }
-	}
-	return true
+// Facet id of a gmsh element whose first nodes are the facet's vertices.
+@(private = "file")
+find_facet :: proc(topo: ^Topology, type: fe.Element_Type, node_indices: []int) -> (id: fe.Entity_ID, ok: bool) {
+	nv := fe.element_n_sub_entities(type, .D0)
+	verts: [fe.MAX_VERTICES]fe.Entity_ID
+	for i in 0 ..< nv { verts[i] = topo.vertex_of_node[node_indices[i]] or_return }
+	if topo.fd == .D0 { return verts[0], true }
+	return topo.tables[topo.fd].ids[vertex_key(verts[:nv])]
 }
 
 @(private = "file")
 gmsh_build_topology :: proc(
 	mesh: ^fe.Mesh,
 	primary: []Raw_Element,
-	boundary: []Raw_Element,
+	facet_elems: []Raw_Element,
 	periodic_links: []Raw_Periodic_Link,
 ) -> bool {
 	if mesh.intrinsic_dim < .D1 {
@@ -613,34 +553,41 @@ gmsh_build_topology :: proc(
 		vertex_of_node = make(map[int]fe.Entity_ID, context.temp_allocator),
 	}
 	for &t in topo.tables {
-		t.ids = make(map[Facet_Key]fe.Entity_ID, context.temp_allocator)
+		t.ids = make(map[Vertex_Key]fe.Entity_ID, context.temp_allocator)
 		t.canonical = make([dynamic][]fe.Entity_ID, context.temp_allocator)
 		t.types = make([dynamic]fe.Element_Type, context.temp_allocator)
 	}
 	perms := make(map[Gmsh_Element_Type][]int, context.temp_allocator)
 
-	n_cells := len(primary)
-	mesh.cells = make([]fe.Cell, n_cells)
-	mesh.cell_conn = make([]fe.Connectivity, n_cells)
-	mesh.cell_nodes = make([][]fe.Entity_ID, n_cells)
+	//== Cells
 
-	for elem, ci in primary {
+	cells := make([dynamic]fe.Entity, 0, len(primary))
+	cell_nodes := make([dynamic][]fe.Entity_ID, 0, len(primary))
+	cell_of := make(map[Vertex_Key]int, context.temp_allocator)
+
+	for elem in primary {
 		et, _ := gmsh_type_to_element_info(elem.type)
+		nv := fe.element_n_sub_entities(et, .D0)
+
+		// v2 writes an element once per physical group it is in
+		key := vertex_key(elem.node_indices[:nv])
+		if ci, dup := cell_of[key]; dup {
+			cells[ci].tags += {int(elem.tags[0])}
+			continue
+		}
+		cell_of[key] = len(cells)
+
 		perm := node_perm(&perms, elem.type) or_return
-
-		cell := &mesh.cells[ci]
-		cell.id = fe.Entity_ID(ci)
-		cell.region = fe.Region_ID(elem.tags[0]) if len(elem.tags) > 0 else 0
-		cell.type = et
-
 		nodes := make([]fe.Entity_ID, len(perm))
 		for g, i in perm { nodes[i] = fe.Entity_ID(elem.node_indices[g]) }
-		mesh.cell_nodes[ci] = nodes
-		cell.affine = is_affine(et, mesh.order, nodes, mesh.nodes)
 
-		conn := &mesh.cell_conn[ci]
-		conn^[.D0] = make([]fe.Entity_ID, fe.element_num_sub_entities(et, .D0))
-		for &v, i in conn^[.D0] {
+		cell := fe.Entity {
+			id   = fe.Entity_ID(len(cells)),
+			type = et,
+			tags = {int(elem.tags[0])},
+		}
+		cell.conn[.D0] = make([]fe.Entity_ID, nv)
+		for &v, i in cell.conn[.D0] {
 			node := int(nodes[i])
 			id, found := topo.vertex_of_node[node]
 			if !found {
@@ -649,109 +596,98 @@ gmsh_build_topology :: proc(
 			}
 			v = id
 		}
+		set_sub_entities(&topo, &cell)
+		cell.conn[cd] = make([]fe.Entity_ID, 1)
+		cell.conn[cd][0] = cell.id
 
-		// Edges and faces, in reference order, each keyed against its canonical order.
-		for d in fe.Dimension {
-			if d == .D0 || d >= cd { continue }
-			conn^[d] = make([]fe.Entity_ID, fe.element_num_sub_entities(et, d))
-			for &id, e in conn^[d] {
-				sub := fe.element_sub_entity(et, d, e)
-				verts := make([]fe.Entity_ID, len(sub.closure[.D0]), context.temp_allocator)
-				for v, k in sub.closure[.D0] { verts[k] = conn^[.D0][v] }
-
-				canon: []fe.Entity_ID
-				id, canon = entity_lookup(&topo.tables[d], sub.type, verts)
-				key := fe.element_orientation(sub.type, verts, canon)
-				if d == .D1 { cell.edge_orientation[e] = key } else { cell.face_orientation[e] = key }
-			}
-		}
-
-		conn^[cd] = make([]fe.Entity_ID, 1)
-		conn^[cd][0] = cell.id
-		cell.facets = conn^[topo.fd]
+		append(&cells, cell)
+		append(&cell_nodes, nodes)
 	}
 
+	mesh.cells = cells[:]
+	mesh.cell_nodes = cell_nodes[:]
 	mesh.n_entities[.D0] = len(topo.vertex_of_node)
 	for d in fe.Dimension {
 		if d != .D0 && d < cd { mesh.n_entities[d] = len(topo.tables[d].canonical) }
 	}
-	mesh.n_entities[cd] = n_cells
-	n_facets := mesh.n_entities[topo.fd]
+	mesh.n_entities[cd] = len(cells)
 
-	// Incidences in cell order, so the first incidence is the cell that fixed the facet's canonical order.
-	facet_inc := make([][dynamic]fe.Facet_Incidence, n_facets, context.temp_allocator)
-	for &incs in facet_inc { incs = make([dynamic]fe.Facet_Incidence, 0, 2, context.temp_allocator) }
-	for cell in mesh.cells {
-		for f, i in cell.facets { append(&facet_inc[f], fe.Facet_Incidence{local_facet = i8(i), cell = cell.id}) }
+	//== Facets
+
+	fd := topo.fd
+	facets := make([]fe.Entity, mesh.n_entities[fd])
+
+	counts := make([]int, len(facets), context.temp_allocator)
+	n_cofaces := 0
+	for cell in cells {
+		for f in cell.conn[fd] { counts[f] += 1 }
+		n_cofaces += len(cell.conn[fd])
+	}
+	all_cofaces := make([]fe.Coface, n_cofaces)
+	total := 0
+	for &facet, f in facets {
+		facet.cofaces = all_cofaces[total:][:counts[f]]
+		total += counts[f]
+		counts[f] = 0
+	}
+	for cell in cells {
+		for f, i in cell.conn[fd] {
+			facets[f].cofaces[counts[f]] = {cell.id, i}
+			counts[f] += 1
+		}
 	}
 
-	boundary_of := make([]fe.Boundary_ID, n_facets, context.temp_allocator)
-	slice.fill(boundary_of, fe.Boundary_ID(fe.NOT_A_BOUNDARY))
-	for elem in boundary {
-		bt, _ := gmsh_type_to_element_info(elem.type)
-		f, found := find_facet(&topo, bt, elem.node_indices)
+	for &facet, f in facets {
+		facet.id = fe.Entity_ID(f)
+		if fd == .D0 {
+			facet.type = .Point
+			facet.conn[.D0] = make([]fe.Entity_ID, 1)
+			facet.conn[.D0][0] = facet.id
+			continue
+		}
+		facet.type = topo.tables[fd].types[f]
+		facet.conn[.D0] = slice.clone(topo.tables[fd].canonical[f])
+		set_sub_entities(&topo, &facet)
+		facet.conn[fd] = make([]fe.Entity_ID, 1)
+		facet.conn[fd][0] = facet.id
+	}
+
+	for elem in facet_elems {
+		ft, _ := gmsh_type_to_element_info(elem.type)
+		f, found := find_facet(&topo, ft, elem.node_indices)
 		if !found {
-			log.errorf("Gmsh: boundary element (nodes=%v) does not match any facet", elem.node_indices)
+			log.errorf("Gmsh: facet element (nodes=%v) does not match any facet", elem.node_indices)
 			return false
 		}
-		if len(elem.tags) > 0 { boundary_of[f] = fe.Boundary_ID(elem.tags[0]) }
+		facets[f].tags += {int(elem.tags[0])}
 	}
 
-	total_incidences := 0
-	for incs in facet_inc { total_incidences += len(incs) }
-	mesh.facets = make([]fe.Facet, n_facets)
-	mesh.incidences = make([]fe.Facet_Incidence, total_incidences)
-
-	cursor := 0
-	for incs, f in facet_inc {
-		affine := true
-		for inc in incs { affine &&= mesh.cells[inc.cell].affine }
-		ftype := fe.Element_Type.Point if topo.fd == .D0 else topo.tables[topo.fd].types[f]
-
-		facet := &mesh.facets[f]
-		facet^ = {
-			id              = fe.Entity_ID(f),
-			incidence_count = i8(len(incs)),
-			incidence_start = cursor,
-			info            = {affine = affine, boundary = boundary_of[f], type = ftype},
-		}
-		copy(mesh.incidences[cursor:], incs[:])
-		cursor += len(incs)
-
-		// A 3D facet as an element: its local order is its canonical order, so only its edges orient.
-		if topo.fd == .D2 {
-			fc := topo.tables[.D2].canonical[f]
-			for k in 0 ..< fe.element_num_sub_entities(ftype, .D1) {
-				ev := fe.element_sub_entity(ftype, .D1, k).closure[.D0]
-				verts := [2]fe.Entity_ID{fc[ev[0]], fc[ev[1]]}
-				eid := topo.tables[.D1].ids[facet_key(verts[:])]
-				facet.edge_orientation[k] = fe.element_orientation(.Line, verts[:], topo.tables[.D1].canonical[eid])
-			}
-		}
-	}
+	mesh.facets = facets
+	mesh.entities[cd] = mesh.cells
+	mesh.entities[fd] = mesh.facets
 
 	if len(periodic_links) > 0 {
-		mesh.periodics = gmsh_build_periodicity(&topo, boundary, periodic_links) or_return
+		mesh.periodics = gmsh_build_periodicity(mesh, &topo, facet_elems, periodic_links) or_return
 	}
 	return true
 }
 
-// For each master facet sub-entity k of dimension d (facet-local order): maps[d][k] is the matching slave
-// sub-entity and orientations[d][k] = element_orientation(type, master's canonical vertices as slave ids,
-// slave's canonical vertices). The facet itself is maps[fd] = {0}; vertices carry no orientation.
+// Links every entity on the master boundary to the slave entity its vertices map onto, once per entity. The key is
+// element_orientation(type, master's canonical vertices as slave ids, slave's canonical vertices).
 @(private = "file")
 gmsh_build_periodicity :: proc(
+	mesh: ^fe.Mesh,
 	topo: ^Topology,
-	boundary: []Raw_Element,
+	facet_elems: []Raw_Element,
 	links: []Raw_Periodic_Link,
 ) -> (
 	periodics: []fe.Periodicity,
 	ok: bool,
 ) {
-	entity_to_boundary := make(map[i32]fe.Boundary_ID, context.temp_allocator)
-	for elem in boundary {
+	tag_of_entity := make(map[i32]fe.Tag_ID, context.temp_allocator)
+	for elem in facet_elems {
 		if len(elem.tags) < 2 { continue }
-		entity_to_boundary[elem.tags[1]] = fe.Boundary_ID(elem.tags[0])
+		tag_of_entity[elem.tags[1]] = fe.Tag_ID(elem.tags[0])
 	}
 
 	result := make([]fe.Periodicity, len(links))
@@ -769,9 +705,11 @@ gmsh_build_periodicity :: proc(
 			}
 		}
 
-		pairs := make([dynamic]fe.Periodic_Pair)
+		per_links: [fe.Dimension][dynamic]fe.Entity_Link
+		seen: [fe.Dimension]map[fe.Entity_ID]bool
+		for d in fe.Dimension { seen[d] = make(map[fe.Entity_ID]bool, context.temp_allocator) }
 
-		for elem in boundary {
+		for elem in facet_elems {
 			if len(elem.tags) < 2 || elem.tags[1] != link.slave_tag { continue }
 			et, _ := gmsh_type_to_element_info(elem.type)
 
@@ -780,10 +718,8 @@ gmsh_build_periodicity :: proc(
 				log.errorf("Gmsh: $Periodic slave element (nodes=%v) does not match any facet", elem.node_indices)
 				return nil, false
 			}
-			sbuf, mbuf: [1]fe.Entity_ID
-			sc := facet_canon(topo, slave, &sbuf)
-
-			mverts := make([]fe.Entity_ID, len(sc), context.temp_allocator)
+			sc := mesh.facets[slave].conn[.D0]
+			mverts: [fe.MAX_VERTICES]fe.Entity_ID
 			for v, i in sc {
 				mverts[i] = master_of[v] or_else -1
 				if mverts[i] < 0 {
@@ -796,63 +732,43 @@ gmsh_build_periodicity :: proc(
 			if topo.fd == .D0 {
 				master, found_master = mverts[0], true
 			} else {
-				master, found_master = topo.tables[topo.fd].ids[facet_key(mverts)]
+				master, found_master = topo.tables[topo.fd].ids[vertex_key(mverts[:len(sc)])]
 			}
 			if !found_master {
-				log.errorf("Gmsh: $Periodic master facet (verts=%v) does not match any facet", mverts)
+				log.errorf("Gmsh: $Periodic master facet (verts=%v) does not match any facet", mverts[:len(sc)])
 				return nil, false
 			}
-			mc := facet_canon(topo, master, &mbuf)
 
-			pair := fe.Periodic_Pair{master = master, slave = slave}
 			for d in fe.Dimension {
 				if d > topo.fd { break }
-				n := fe.element_num_sub_entities(et, d)
-				pair.maps[d] = make([]int, n)
-				if d != .D0 { pair.orientations[d] = make([]u8, n) }
-
-				for k in 0 ..< n {
-					lv := fe.element_sub_entity(et, d, k).closure[.D0]
-					master_verts := make([]fe.Entity_ID, len(lv), context.temp_allocator)
-					translated := make([]fe.Entity_ID, len(lv), context.temp_allocator)
-					for v, i in lv {
-						master_verts[i] = mc[v]
-						translated[i] = slave_of[mc[v]]
+				for gid in mesh.facets[master].conn[d] {
+					if seen[d][gid] { continue }
+					seen[d][gid] = true
+					if d == .D0 {
+						append(&per_links[d], fe.Entity_Link{master = gid, slave = slave_of[gid]})
+						continue
 					}
-					want := facet_key(translated)
-
-					sk := -1
-					for k2 in 0 ..< n {
-						lv2 := fe.element_sub_entity(et, d, k2).closure[.D0]
-						cand := make([]fe.Entity_ID, len(lv2), context.temp_allocator)
-						for v, i in lv2 { cand[i] = sc[v] }
-						if facet_key(cand) == want { sk = k2; break }
-					}
-					if sk < 0 {
-						log.errorf("Gmsh: $Periodic could not match sub-entity %d (dim %v) of facet %d", k, d, master)
+					t := &topo.tables[d]
+					mcanon := t.canonical[gid]
+					translated: [fe.MAX_VERTICES]fe.Entity_ID
+					for v, i in mcanon { translated[i] = slave_of[v] }
+					s_id, found := t.ids[vertex_key(translated[:len(mcanon)])]
+					if !found {
+						log.errorf("Gmsh: $Periodic entity %d (dim %v) has no slave image", gid, d)
 						return nil, false
 					}
-					pair.maps[d][k] = sk
-					if d == .D0 { continue }
-
-					// canonical orders of both entities, the master's expressed in slave vertex ids
-					t := &topo.tables[d]
-					mcanon := t.canonical[t.ids[facet_key(master_verts)]]
-					scanon := t.canonical[t.ids[want]]
-					mcanon_in_slave := make([]fe.Entity_ID, len(mcanon), context.temp_allocator)
-					for v, i in mcanon { mcanon_in_slave[i] = slave_of[v] }
-					pair.orientations[d][k] = fe.element_orientation(fe.element_sub_entity(et, d, k).type, mcanon_in_slave, scanon)
+					key := fe.element_orientation(t.types[gid], translated[:len(mcanon)], t.canonical[s_id])
+					append(&per_links[d], fe.Entity_Link{master = gid, slave = s_id, key = key})
 				}
 			}
-			append(&pairs, pair)
 		}
 
 		result[li] = fe.Periodicity {
-			slave     = entity_to_boundary[link.slave_tag] or_else fe.Boundary_ID(fe.NOT_A_BOUNDARY),
-			master    = entity_to_boundary[link.master_tag] or_else fe.Boundary_ID(fe.NOT_A_BOUNDARY),
+			slave     = tag_of_entity[link.slave_tag] or_else 0,
+			master    = tag_of_entity[link.master_tag] or_else 0,
 			transform = link.transform,
-			pairs     = pairs[:],
 		}
+		for d in fe.Dimension { result[li].links[d] = per_links[d][:] }
 	}
 
 	return result, true

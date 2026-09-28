@@ -1,75 +1,43 @@
 package fe
 
 /*
- General linear algebra containers for, possibly sparse, systems of linear equations.
- For sparse matrices, CSR format is used
+ Containers and operations for large, possibly sparse, systems of linear equations. Sparse matrices are CSR.
+
+ `_rank` variants are collective: each rank works on its rank_slice, syncing before it reads and after it writes, so
+ the data is consistent on every rank before and after the call whatever partition wrote it.
 */
 
 import "core:math"
 import "core:slice"
 
-// Arbitrary length vector
 Vector :: []f64
 
-// Basic sparse matrix
+// CSR sparsity pattern.
+Sparsity :: struct {
+	row_ptrs: []i32,
+	columns:  []i32, // sorted per row
+}
+
 Sparse_Matrix :: struct {
 	using sp: Sparsity,
 	values:   []f64,
 }
 
-// CSR sparsity pattern
-Sparsity :: struct {
-	row_ptrs: []i32,
-	columns:  []i32, // should be sorted per row
+// Square block matrix over a partition of a flat vector. Block (i, j) is blocks[i * n + j], block i's rows and
+// columns are [offsets[i], offsets[i + 1]).
+Block_Sparse :: struct {
+	n:       int,
+	offsets: []int,
+	blocks:  []Sparse_Matrix,
 }
 
-// Column-major
+// Column-major.
 Dense_Matrix :: struct {
 	values:     []f64,
 	rows, cols: i32,
 }
 
-//== Access & Creation
-
-dense_create :: proc(#any_int rows, cols: i32, alloc := context.allocator) -> Dense_Matrix {
-	assert(rows > 0 && cols > 0)
-	return {values = make([]f64, rows * cols, alloc), rows = rows, cols = cols}
-}
-
-// Will panic (if bounds checking is enabled) if is out of bounds.
-dn_get :: proc(d: Dense_Matrix, #any_int row, col: i32) -> ^f64 {
-	return &d.values[col * d.rows + row]
-}
-
-// Column j of d as a Vector view.
-dn_col :: proc(d: Dense_Matrix, #any_int j: int) -> Vector {
-	return d.values[j * int(d.rows):(j + 1) * int(d.rows)]
-}
-
-// Pivot columns for factorizations
-dn_pivots :: proc(a: Dense_Matrix, alloc := context.allocator) -> []i32 {
-	return make([]i32, a.rows, alloc)
-}
-
-// Does not copy sparsity
-sparse_from_sparsity :: proc(sp: Sparsity, alloc := context.allocator) -> Sparse_Matrix {
-	return {sp = sp, values = make([]f64, len(sp.columns), alloc)}
-}
-
-// Returns nil if entry does not exist.
-sp_get :: proc(sm: Sparse_Matrix, #any_int row, col: i32) -> ^f64 {
-	row_slice := sm.columns[sm.row_ptrs[row]:sm.row_ptrs[row + 1]]
-	idx, found := slice.binary_search(row_slice, col)
-	if !found { return nil }
-	return &sm.values[int(sm.row_ptrs[row]) + idx]
-}
-
-// Number of rows in the matrix, size of compatible vector.
-sp_n_rows :: proc(sp: Sparsity) -> int {
-	return len(sp.row_ptrs) - 1
-}
-
-//== Vector operations
+//== Vector
 
 // a . b
 vec_dot :: proc(a, b: Vector) -> f64 {
@@ -80,6 +48,7 @@ vec_dot :: proc(a, b: Vector) -> f64 {
 }
 
 vec_dot_rank :: proc(a, b: Vector) -> f64 {
+	rank_sync()
 	return rank_sum(vec_dot(rank_slice(a), rank_slice(b)))
 }
 
@@ -98,7 +67,15 @@ vec_scale :: proc(a: Vector, alpha: f64) {
 }
 
 vec_scale_rank :: proc(a: Vector, alpha: f64) {
+	rank_sync()
 	vec_scale(rank_slice(a), alpha)
+	rank_sync()
+}
+
+vec_zero_rank :: proc(a: Vector) {
+	rank_sync()
+	slice.zero(rank_slice(a))
+	rank_sync()
 }
 
 // y += a * x
@@ -108,10 +85,68 @@ vec_axpy :: proc(x, y: Vector, a: f64 = 1) {
 }
 
 vec_axpy_rank :: proc(x, y: Vector, a: f64 = 1) {
+	rank_sync()
 	vec_axpy(rank_slice(x), rank_slice(y), a)
+	rank_sync()
+}
+
+//== Sparse
+
+// Number of rows, the size of a compatible vector.
+sp_n_rows :: proc(sp: Sparsity) -> int {
+	return len(sp.row_ptrs) - 1
+}
+
+// Entry (row, col), nil if it isn't in the pattern.
+sp_get :: proc(sm: Sparse_Matrix, #any_int row, col: i32) -> ^f64 {
+	row_slice := sm.columns[sm.row_ptrs[row]:sm.row_ptrs[row + 1]]
+	idx, found := slice.binary_search(row_slice, col)
+	if !found { return nil }
+	return &sm.values[int(sm.row_ptrs[row]) + idx]
+}
+
+// Zero matrix over an existing pattern, which is shared, not copied.
+sp_from_sparsity :: proc(sp: Sparsity, alloc := context.allocator) -> Sparse_Matrix {
+	return {sp = sp, values = make([]f64, len(sp.columns), alloc)}
 }
 
 //== Sparse ops
+
+// Values to zero, the pattern is kept.
+sp_zero :: proc(m: Sparse_Matrix) {
+	slice.zero(m.values)
+}
+
+// alpha a + beta b on the union of their patterns.
+sp_sum :: proc(a, b: Sparse_Matrix, alpha, beta: f64, alloc := context.allocator) -> Sparse_Matrix {
+	n := sp_n_rows(a)
+	assert(n == sp_n_rows(b))
+	row_ptrs := make([]i32, n + 1, alloc)
+	columns := make([dynamic]i32, 0, len(a.columns) + len(b.columns), alloc)
+	values := make([dynamic]f64, 0, len(a.columns) + len(b.columns), alloc)
+
+	// merge each row's sorted columns
+	for row in 0 ..< n {
+		ia, ib := a.row_ptrs[row], b.row_ptrs[row]
+		for ia < a.row_ptrs[row + 1] || ib < b.row_ptrs[row + 1] {
+			ca := a.columns[ia] if ia < a.row_ptrs[row + 1] else max(i32)
+			cb := b.columns[ib] if ib < b.row_ptrs[row + 1] else max(i32)
+			col, v := min(ca, cb), 0.0
+			if ca == col {
+				v += alpha * a.values[ia]
+				ia += 1
+			}
+			if cb == col {
+				v += beta * b.values[ib]
+				ib += 1
+			}
+			append(&columns, col)
+			append(&values, v)
+		}
+		row_ptrs[row + 1] = i32(len(columns))
+	}
+	return {sp = {row_ptrs = row_ptrs, columns = columns[:]}, values = values[:]}
+}
 
 // y = alpha * A * x + beta * y (x, y must not alias)
 sp_gemv :: proc(a: Sparse_Matrix, x, y: Vector, alpha := 1.0, beta := 0.0) {
@@ -158,7 +193,7 @@ sp_inner_rank :: proc(a: Sparse_Matrix, x, y: Vector) -> f64 {
 	return rank_sum(sp_inner(mine, x[r.min:r.max], y)) // rank_sum's barrier covers the exit
 }
 
-// scale v to unit M-norm, returns the original norm
+// Scales v to unit M-norm, returns the original norm.
 sp_normalize :: proc(M: Sparse_Matrix, v: Vector) -> f64 {
 	nrm := math.sqrt(sp_inner(M, v, v))
 	if nrm > 1e-30 { vec_scale(v, 1.0 / nrm) }
@@ -171,7 +206,72 @@ sp_normalize_rank :: proc(M: Sparse_Matrix, v: Vector) -> f64 {
 	return nrm
 }
 
-//== Dense ops
+//== Block sparse
+
+// Values to zero, the patterns are kept.
+bsp_zero :: proc(a: Block_Sparse) {
+	for b in a.blocks { sp_zero(b) }
+}
+
+// y = alpha * A * x + beta * y on the flat vectors (x, y must not alias)
+bsp_gemv :: proc(a: Block_Sparse, x, y: Vector, alpha := 1.0, beta := 0.0) {
+	for i in 0 ..< a.n {
+		yi := y[a.offsets[i]:a.offsets[i + 1]]
+		for j in 0 ..< a.n {
+			sp_gemv(a.blocks[i * a.n + j], x[a.offsets[j]:a.offsets[j + 1]], yi, alpha, beta if j == 0 else 1)
+		}
+	}
+}
+
+// Every block in one CSR over the flat vector. A single block is returned as is, shared rather than copied.
+bsp_to_sp :: proc(a: Block_Sparse, alloc := context.allocator) -> Sparse_Matrix {
+	if a.n == 1 { return a.blocks[0] }
+
+	nnz := 0
+	for blk in a.blocks { nnz += len(blk.columns) }
+	row_ptrs := make([]i32, a.offsets[a.n] + 1, alloc)
+	columns := make([]i32, nnz, alloc)
+	values := make([]f64, nnz, alloc)
+
+	// a flat row is its blocks' rows side by side, block columns are disjoint increasing ranges so it stays sorted
+	k := 0
+	for i in 0 ..< a.n {
+		for row in 0 ..< a.offsets[i + 1] - a.offsets[i] {
+			for j in 0 ..< a.n {
+				blk := a.blocks[i * a.n + j]
+				for idx in blk.row_ptrs[row] ..< blk.row_ptrs[row + 1] {
+					columns[k] = i32(a.offsets[j]) + blk.columns[idx]
+					values[k] = blk.values[idx]
+					k += 1
+				}
+			}
+			row_ptrs[a.offsets[i] + row + 1] = i32(k)
+		}
+	}
+	return {sp = {row_ptrs = row_ptrs, columns = columns}, values = values}
+}
+
+//== Dense
+
+dn_create :: proc(#any_int rows, cols: i32, alloc := context.allocator) -> Dense_Matrix {
+	assert(rows > 0 && cols > 0)
+	return {values = make([]f64, rows * cols, alloc), rows = rows, cols = cols}
+}
+
+// Entry (row, col), bounds checked.
+dn_get :: proc(d: Dense_Matrix, #any_int row, col: i32) -> ^f64 {
+	return &d.values[col * d.rows + row]
+}
+
+// Column j of d as a Vector view.
+dn_col :: proc(d: Dense_Matrix, #any_int j: int) -> Vector {
+	return d.values[j * int(d.rows):(j + 1) * int(d.rows)]
+}
+
+// Pivot storage for dn_lu_factor.
+dn_pivots :: proc(a: Dense_Matrix, alloc := context.allocator) -> []i32 {
+	return make([]i32, a.rows, alloc)
+}
 
 dn_copy :: proc(dst, src: Dense_Matrix) {
 	assert(dst.rows == src.rows && dst.cols == src.cols)
@@ -216,7 +316,7 @@ dn_gemm :: proc(a, b, c: Dense_Matrix, alpha := 1.0, beta := 0.0) {
 	}
 }
 
-// in-place LU with partial pivoting.
+// In-place LU with partial pivoting.
 dn_lu_factor :: proc(a: Dense_Matrix, pivots: []i32) -> (ok: bool) {
 	n := int(a.rows)
 	assert(a.rows == a.cols && len(pivots) >= n)
@@ -251,7 +351,7 @@ dn_lu_factor :: proc(a: Dense_Matrix, pivots: []i32) -> (ok: bool) {
 	return true
 }
 
-// solve A x = b in place using dn_lu_factor's result
+// Solves A x = b in place with dn_lu_factor's result.
 dn_lu_solve_vec :: proc(lu: Dense_Matrix, pivots: []i32, b: Vector) {
 	n := int(lu.rows)
 	assert(lu.rows == lu.cols && len(pivots) >= n && len(b) == n)
@@ -269,7 +369,7 @@ dn_lu_solve_vec :: proc(lu: Dense_Matrix, pivots: []i32, b: Vector) {
 	}
 }
 
-// solve A X = B in place, one right-hand side per column of B
+// Solves A X = B in place, one right-hand side per column of B.
 dn_lu_solve :: proc(lu: Dense_Matrix, pivots: []i32, b: Dense_Matrix) {
 	assert(lu.rows == b.rows)
 	for j in 0 ..< b.cols {

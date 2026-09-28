@@ -5,14 +5,14 @@
 //   Quad / Hex vertices in tensor order: vertex i = (bit0, bit1, bit2) of i, 0 -> -1, 1 -> +1.
 //   Sub-entity numbering and local vertex order: see sub_entities[d][e].closure[.D0].
 //
+// Sub-entities: lift maps the sub-entity's reference into the parent's (x = origin + jac s).
+// Facet normals: outward, length = facet size in the parent / facet size in its own reference.
+//
 // Orientation keys (Line, Tri, Quad):
-//   orientation_perms[key][i] = position, in the entity's CANONICAL vertex order, of the entity's local vertex i.
-//   This is exactly what element_orientation(et, local_order = cell-local entity vertices (global ids),
-//   target_order = canonical order) returns. The canonical order can be ANY fixed vertex order of the entity
-//   that every cell sharing it agrees on, provided it is a symmetry image of a local order (always true when
-//   it is taken from a cell, e.g. "the local order of the first cell that encounters the entity", which then
-//   gets key 0). Sorted-by-global-id canonical orders (Line, Tri) also work. Both are tested.
-//   Key 0 is the identity.
+//   orientation_perms[key][i] = position, in the entity's canonical vertex order, of the entity's local vertex i.
+//   Canonical order comes from global vertex ids (element_canonical_order): sorted for Line / Tri, smallest id
+//   first then its smaller neighbour for Quad. orientation_maps[key] moves an entity reference point to where
+//   it sits under the key. Key 0 is the identity. First-cell-seen canonical orders are also tested.
 //
 // Dof functionals: weights are Bvecs [point][dof][cmpnt] with the quadrature weight folded in. Moments use Legendre q on lines and quads (tensor), Lagrange q on triangle faces, monomials
 // on simplex interiors. Normal / tangent directions follow the entity's closure[.D0] vertex order (not outward).
@@ -31,7 +31,7 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 			vertices = {{0, 0, 0}},
 			sub_entities = {
 				.D0 = {
-					{type = .Point, closure = {.D0 = {0}, .D1 = nil, .D2 = nil, .D3 = nil}},
+					{type = .Point, closure = {.D0 = {0}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {0, 0, 0}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
 				},
 				.D1 = nil,
 				.D2 = nil,
@@ -39,6 +39,7 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 			},
 			facet_normals = nil,
 			orientation_perms = nil,
+			orientation_maps = nil,
 		},
 		quadrature = {
 			.Q1 = {
@@ -63,6 +64,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O0 = {
 					n_dofs = 1,
 					dofs_per_entity = {.D0 = 1, .D1 = 0, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 1, .D2 = 1, .D3 = 1},
+					closure_dofs = {
+						.D0 = {{0}},
+						.D1 = nil,
+						.D2 = nil,
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = ref_point_lagrange_o0_s_val,
 						.V_Val = nil,
@@ -93,6 +101,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O1 = {
 					n_dofs = 1,
 					dofs_per_entity = {.D0 = 1, .D1 = 0, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 1, .D2 = 1, .D3 = 1},
+					closure_dofs = {
+						.D0 = {{0}},
+						.D1 = nil,
+						.D2 = nil,
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = ref_point_lagrange_o1_s_val,
 						.V_Val = nil,
@@ -123,6 +138,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O2 = {
 					n_dofs = 1,
 					dofs_per_entity = {.D0 = 1, .D1 = 0, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 1, .D2 = 1, .D3 = 1},
+					closure_dofs = {
+						.D0 = {{0}},
+						.D1 = nil,
+						.D2 = nil,
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = ref_point_lagrange_o2_s_val,
 						.V_Val = nil,
@@ -153,6 +175,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O3 = {
 					n_dofs = 1,
 					dofs_per_entity = {.D0 = 1, .D1 = 0, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 1, .D2 = 1, .D3 = 1},
+					closure_dofs = {
+						.D0 = {{0}},
+						.D1 = nil,
+						.D2 = nil,
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = ref_point_lagrange_o3_s_val,
 						.V_Val = nil,
@@ -201,17 +230,21 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 			vertices = {{-1, 0, 0}, {1, 0, 0}},
 			sub_entities = {
 				.D0 = {
-					{type = .Point, closure = {.D0 = {0}, .D1 = nil, .D2 = nil, .D3 = nil}},
-					{type = .Point, closure = {.D0 = {1}, .D1 = nil, .D2 = nil, .D3 = nil}},
+					{type = .Point, closure = {.D0 = {0}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {-1, 0, 0}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Point, closure = {.D0 = {1}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {1, 0, 0}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
 				},
 				.D1 = {
-					{type = .Line, closure = {.D0 = {0, 1}, .D1 = {0}, .D2 = nil, .D3 = nil}},
+					{type = .Line, closure = {.D0 = {0, 1}, .D1 = {0}, .D2 = nil, .D3 = nil}, lift = {origin = {0, 0, 0}, jac = {{1, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
 				},
 				.D2 = nil,
 				.D3 = nil,
 			},
 			facet_normals = {{-1, 0, 0}, {1, 0, 0}},
 			orientation_perms = {{0, 1}, {1, 0}},
+			orientation_maps = {
+				{origin = {0, 0, 0}, jac = {{1, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+				{origin = {0, 0, 0}, jac = {{-1, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+			},
 		},
 		quadrature = {
 			.Q1 = {
@@ -236,6 +269,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O0 = {
 					n_dofs = 1,
 					dofs_per_entity = {.D0 = 0, .D1 = 1, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 1, .D3 = 1},
+					closure_dofs = {
+						.D0 = {{}, {}},
+						.D1 = {{0}},
+						.D2 = nil,
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = ref_line_lagrange_o0_s_val,
 						.V_Val = nil,
@@ -266,6 +306,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O1 = {
 					n_dofs = 2,
 					dofs_per_entity = {.D0 = 1, .D1 = 0, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 2, .D2 = 2, .D3 = 2},
+					closure_dofs = {
+						.D0 = {{0}, {1}},
+						.D1 = {{0, 1}},
+						.D2 = nil,
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = ref_line_lagrange_o1_s_val,
 						.V_Val = nil,
@@ -300,6 +347,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O2 = {
 					n_dofs = 3,
 					dofs_per_entity = {.D0 = 1, .D1 = 1, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 2, .D2 = 3, .D3 = 3},
+					closure_dofs = {
+						.D0 = {{0}, {1}},
+						.D1 = {{0, 1, 2}},
+						.D2 = nil,
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = ref_line_lagrange_o2_s_val,
 						.V_Val = nil,
@@ -339,6 +393,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O3 = {
 					n_dofs = 4,
 					dofs_per_entity = {.D0 = 1, .D1 = 2, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 2, .D2 = 4, .D3 = 4},
+					closure_dofs = {
+						.D0 = {{0}, {1}},
+						.D1 = {{0, 1, 2, 3}},
+						.D2 = nil,
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = ref_line_lagrange_o3_s_val,
 						.V_Val = nil,
@@ -396,22 +457,30 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 			vertices = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}},
 			sub_entities = {
 				.D0 = {
-					{type = .Point, closure = {.D0 = {0}, .D1 = nil, .D2 = nil, .D3 = nil}},
-					{type = .Point, closure = {.D0 = {1}, .D1 = nil, .D2 = nil, .D3 = nil}},
-					{type = .Point, closure = {.D0 = {2}, .D1 = nil, .D2 = nil, .D3 = nil}},
+					{type = .Point, closure = {.D0 = {0}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {0, 0, 0}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Point, closure = {.D0 = {1}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {1, 0, 0}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Point, closure = {.D0 = {2}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {0, 1, 0}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
 				},
 				.D1 = {
-					{type = .Line, closure = {.D0 = {1, 2}, .D1 = {0}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {0, 2}, .D1 = {1}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {0, 1}, .D1 = {2}, .D2 = nil, .D3 = nil}},
+					{type = .Line, closure = {.D0 = {1, 2}, .D1 = {0}, .D2 = nil, .D3 = nil}, lift = {origin = {0.5, 0.5, 0}, jac = {{-0.5, 0.5, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {0, 2}, .D1 = {1}, .D2 = nil, .D3 = nil}, lift = {origin = {0, 0.5, 0}, jac = {{0, 0.5, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {0, 1}, .D1 = {2}, .D2 = nil, .D3 = nil}, lift = {origin = {0.5, 0, 0}, jac = {{0.5, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
 				},
 				.D2 = {
-					{type = .Tri, closure = {.D0 = {0, 1, 2}, .D1 = {0, 1, 2}, .D2 = {0}, .D3 = nil}},
+					{type = .Tri, closure = {.D0 = {0, 1, 2}, .D1 = {0, 1, 2}, .D2 = {0}, .D3 = nil}, lift = {origin = {0, 0, 0}, jac = {{1, 0, 0}, {0, 1, 0}, {0, 0, 0}}}},
 				},
 				.D3 = nil,
 			},
 			facet_normals = {{0.5, 0.5, 0}, {-0.5, 0, 0}, {0, -0.5, 0}},
 			orientation_perms = {{0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {0, 2, 1}, {2, 1, 0}, {1, 0, 2}},
+			orientation_maps = {
+				{origin = {0, 0, 0}, jac = {{1, 0, 0}, {0, 1, 0}, {0, 0, 0}}},
+				{origin = {0, 1, 0}, jac = {{0, -1, 0}, {1, -1, 0}, {0, 0, 0}}},
+				{origin = {1, 0, 0}, jac = {{-1, 1, 0}, {-1, 0, 0}, {0, 0, 0}}},
+				{origin = {0, 0, 0}, jac = {{0, 1, 0}, {1, 0, 0}, {0, 0, 0}}},
+				{origin = {0, 1, 0}, jac = {{1, -1, 0}, {0, -1, 0}, {0, 0, 0}}},
+				{origin = {1, 0, 0}, jac = {{-1, 0, 0}, {-1, 1, 0}, {0, 0, 0}}},
+			},
 		},
 		quadrature = {
 			.Q1 = {
@@ -456,6 +525,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O0 = {
 					n_dofs = 1,
 					dofs_per_entity = {.D0 = 0, .D1 = 0, .D2 = 1, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 0, .D3 = 1},
+					closure_dofs = {
+						.D0 = {{}, {}, {}},
+						.D1 = {{}, {}, {}},
+						.D2 = {{0}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = ref_tri_lagrange_o0_s_val,
 						.V_Val = nil,
@@ -486,6 +562,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O1 = {
 					n_dofs = 3,
 					dofs_per_entity = {.D0 = 1, .D1 = 0, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 3, .D2 = 3, .D3 = 3},
+					closure_dofs = {
+						.D0 = {{0}, {1}, {2}},
+						.D1 = {{1, 2}, {0, 2}, {0, 1}},
+						.D2 = {{0, 1, 2}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = ref_tri_lagrange_o1_s_val,
 						.V_Val = nil,
@@ -524,6 +607,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O2 = {
 					n_dofs = 6,
 					dofs_per_entity = {.D0 = 1, .D1 = 1, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 3, .D2 = 6, .D3 = 6},
+					closure_dofs = {
+						.D0 = {{0}, {1}, {2}},
+						.D1 = {{1, 2, 3}, {0, 2, 4}, {0, 1, 5}},
+						.D2 = {{0, 1, 2, 3, 4, 5}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = ref_tri_lagrange_o2_s_val,
 						.V_Val = nil,
@@ -575,6 +665,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O3 = {
 					n_dofs = 10,
 					dofs_per_entity = {.D0 = 1, .D1 = 2, .D2 = 1, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 3, .D2 = 9, .D3 = 10},
+					closure_dofs = {
+						.D0 = {{0}, {1}, {2}},
+						.D1 = {{1, 2, 3, 4}, {0, 2, 5, 6}, {0, 1, 7, 8}},
+						.D2 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = ref_tri_lagrange_o3_s_val,
 						.V_Val = nil,
@@ -636,6 +733,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O0 = {
 					n_dofs = 3,
 					dofs_per_entity = {.D0 = 0, .D1 = 1, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 3, .D3 = 3},
+					closure_dofs = {
+						.D0 = {{}, {}, {}},
+						.D1 = {{0}, {1}, {2}},
+						.D2 = {{0, 1, 2}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_tri_raviart_thomas_o0_v_val,
@@ -677,6 +781,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O1 = {
 					n_dofs = 8,
 					dofs_per_entity = {.D0 = 0, .D1 = 2, .D2 = 2, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 6, .D3 = 8},
+					closure_dofs = {
+						.D0 = {{}, {}, {}},
+						.D1 = {{0, 1}, {2, 3}, {4, 5}},
+						.D2 = {{0, 1, 2, 3, 4, 5, 6, 7}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_tri_raviart_thomas_o1_v_val,
@@ -730,6 +841,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O2 = {
 					n_dofs = 15,
 					dofs_per_entity = {.D0 = 0, .D1 = 3, .D2 = 6, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 9, .D3 = 15},
+					closure_dofs = {
+						.D0 = {{}, {}, {}},
+						.D1 = {{0, 1, 2}, {3, 4, 5}, {6, 7, 8}},
+						.D2 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_tri_raviart_thomas_o2_v_val,
@@ -814,6 +932,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O0 = {
 					n_dofs = 3,
 					dofs_per_entity = {.D0 = 0, .D1 = 1, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 3, .D3 = 3},
+					closure_dofs = {
+						.D0 = {{}, {}, {}},
+						.D1 = {{0}, {1}, {2}},
+						.D2 = {{0, 1, 2}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_tri_nedelec_o0_v_val,
@@ -855,6 +980,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O1 = {
 					n_dofs = 8,
 					dofs_per_entity = {.D0 = 0, .D1 = 2, .D2 = 2, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 6, .D3 = 8},
+					closure_dofs = {
+						.D0 = {{}, {}, {}},
+						.D1 = {{0, 1}, {2, 3}, {4, 5}},
+						.D2 = {{0, 1, 2, 3, 4, 5, 6, 7}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_tri_nedelec_o1_v_val,
@@ -908,6 +1040,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O2 = {
 					n_dofs = 15,
 					dofs_per_entity = {.D0 = 0, .D1 = 3, .D2 = 6, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 9, .D3 = 15},
+					closure_dofs = {
+						.D0 = {{}, {}, {}},
+						.D1 = {{0, 1, 2}, {3, 4, 5}, {6, 7, 8}},
+						.D2 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_tri_nedelec_o2_v_val,
@@ -996,24 +1135,34 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 			vertices = {{-1, -1, 0}, {1, -1, 0}, {-1, 1, 0}, {1, 1, 0}},
 			sub_entities = {
 				.D0 = {
-					{type = .Point, closure = {.D0 = {0}, .D1 = nil, .D2 = nil, .D3 = nil}},
-					{type = .Point, closure = {.D0 = {1}, .D1 = nil, .D2 = nil, .D3 = nil}},
-					{type = .Point, closure = {.D0 = {2}, .D1 = nil, .D2 = nil, .D3 = nil}},
-					{type = .Point, closure = {.D0 = {3}, .D1 = nil, .D2 = nil, .D3 = nil}},
+					{type = .Point, closure = {.D0 = {0}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {-1, -1, 0}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Point, closure = {.D0 = {1}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {1, -1, 0}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Point, closure = {.D0 = {2}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {-1, 1, 0}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Point, closure = {.D0 = {3}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {1, 1, 0}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
 				},
 				.D1 = {
-					{type = .Line, closure = {.D0 = {0, 1}, .D1 = {0}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {0, 2}, .D1 = {1}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {1, 3}, .D1 = {2}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {2, 3}, .D1 = {3}, .D2 = nil, .D3 = nil}},
+					{type = .Line, closure = {.D0 = {0, 1}, .D1 = {0}, .D2 = nil, .D3 = nil}, lift = {origin = {0, -1, 0}, jac = {{1, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {0, 2}, .D1 = {1}, .D2 = nil, .D3 = nil}, lift = {origin = {-1, 0, 0}, jac = {{0, 1, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {1, 3}, .D1 = {2}, .D2 = nil, .D3 = nil}, lift = {origin = {1, 0, 0}, jac = {{0, 1, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {2, 3}, .D1 = {3}, .D2 = nil, .D3 = nil}, lift = {origin = {0, 1, 0}, jac = {{1, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
 				},
 				.D2 = {
-					{type = .Quad, closure = {.D0 = {0, 1, 2, 3}, .D1 = {0, 1, 2, 3}, .D2 = {0}, .D3 = nil}},
+					{type = .Quad, closure = {.D0 = {0, 1, 2, 3}, .D1 = {0, 1, 2, 3}, .D2 = {0}, .D3 = nil}, lift = {origin = {0, 0, 0}, jac = {{1, 0, 0}, {0, 1, 0}, {0, 0, 0}}}},
 				},
 				.D3 = nil,
 			},
 			facet_normals = {{0, -1, 0}, {-1, 0, 0}, {1, 0, 0}, {0, 1, 0}},
 			orientation_perms = {{0, 1, 2, 3}, {3, 2, 1, 0}, {2, 0, 3, 1}, {1, 3, 0, 2}, {2, 3, 0, 1}, {1, 0, 3, 2}, {0, 2, 1, 3}, {3, 1, 2, 0}},
+			orientation_maps = {
+				{origin = {0, 0, 0}, jac = {{1, 0, 0}, {0, 1, 0}, {0, 0, 0}}},
+				{origin = {0, 0, 0}, jac = {{-1, 0, 0}, {0, -1, 0}, {0, 0, 0}}},
+				{origin = {0, 0, 0}, jac = {{0, 1, 0}, {-1, 0, 0}, {0, 0, 0}}},
+				{origin = {0, 0, 0}, jac = {{0, -1, 0}, {1, 0, 0}, {0, 0, 0}}},
+				{origin = {0, 0, 0}, jac = {{1, 0, 0}, {0, -1, 0}, {0, 0, 0}}},
+				{origin = {0, 0, 0}, jac = {{-1, 0, 0}, {0, 1, 0}, {0, 0, 0}}},
+				{origin = {0, 0, 0}, jac = {{0, 1, 0}, {1, 0, 0}, {0, 0, 0}}},
+				{origin = {0, 0, 0}, jac = {{0, -1, 0}, {-1, 0, 0}, {0, 0, 0}}},
+			},
 		},
 		quadrature = {
 			.Q1 = {
@@ -1053,6 +1202,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O0 = {
 					n_dofs = 1,
 					dofs_per_entity = {.D0 = 0, .D1 = 0, .D2 = 1, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 0, .D3 = 1},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}},
+						.D1 = {{}, {}, {}, {}},
+						.D2 = {{0}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = ref_quad_lagrange_o0_s_val,
 						.V_Val = nil,
@@ -1083,6 +1239,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O1 = {
 					n_dofs = 4,
 					dofs_per_entity = {.D0 = 1, .D1 = 0, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 4, .D2 = 4, .D3 = 4},
+					closure_dofs = {
+						.D0 = {{0}, {1}, {2}, {3}},
+						.D1 = {{0, 1}, {0, 2}, {1, 3}, {2, 3}},
+						.D2 = {{0, 1, 2, 3}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = ref_quad_lagrange_o1_s_val,
 						.V_Val = nil,
@@ -1125,6 +1288,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O2 = {
 					n_dofs = 9,
 					dofs_per_entity = {.D0 = 1, .D1 = 1, .D2 = 1, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 4, .D2 = 8, .D3 = 9},
+					closure_dofs = {
+						.D0 = {{0}, {1}, {2}, {3}},
+						.D1 = {{0, 1, 4}, {0, 2, 5}, {1, 3, 6}, {2, 3, 7}},
+						.D2 = {{0, 1, 2, 3, 4, 5, 6, 7, 8}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = ref_quad_lagrange_o2_s_val,
 						.V_Val = nil,
@@ -1189,6 +1359,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O3 = {
 					n_dofs = 16,
 					dofs_per_entity = {.D0 = 1, .D1 = 2, .D2 = 4, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 4, .D2 = 12, .D3 = 16},
+					closure_dofs = {
+						.D0 = {{0}, {1}, {2}, {3}},
+						.D1 = {{0, 1, 4, 5}, {0, 2, 6, 7}, {1, 3, 8, 9}, {2, 3, 10, 11}},
+						.D2 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = ref_quad_lagrange_o3_s_val,
 						.V_Val = nil,
@@ -1261,6 +1438,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O0 = {
 					n_dofs = 4,
 					dofs_per_entity = {.D0 = 0, .D1 = 1, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 4, .D3 = 4},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}},
+						.D1 = {{0}, {1}, {2}, {3}},
+						.D2 = {{0, 1, 2, 3}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_quad_raviart_thomas_o0_v_val,
@@ -1306,6 +1490,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O1 = {
 					n_dofs = 12,
 					dofs_per_entity = {.D0 = 0, .D1 = 2, .D2 = 4, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 8, .D3 = 12},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}},
+						.D1 = {{0, 1}, {2, 3}, {4, 5}, {6, 7}},
+						.D2 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_quad_raviart_thomas_o1_v_val,
@@ -1361,6 +1552,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O2 = {
 					n_dofs = 24,
 					dofs_per_entity = {.D0 = 0, .D1 = 3, .D2 = 12, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 12, .D3 = 24},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}},
+						.D1 = {{0, 1, 2}, {3, 4, 5}, {6, 7, 8}, {9, 10, 11}},
+						.D2 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_quad_raviart_thomas_o2_v_val,
@@ -1462,6 +1660,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O0 = {
 					n_dofs = 4,
 					dofs_per_entity = {.D0 = 0, .D1 = 1, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 4, .D3 = 4},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}},
+						.D1 = {{0}, {1}, {2}, {3}},
+						.D2 = {{0, 1, 2, 3}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_quad_nedelec_o0_v_val,
@@ -1507,6 +1712,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O1 = {
 					n_dofs = 12,
 					dofs_per_entity = {.D0 = 0, .D1 = 2, .D2 = 4, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 8, .D3 = 12},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}},
+						.D1 = {{0, 1}, {2, 3}, {4, 5}, {6, 7}},
+						.D2 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_quad_nedelec_o1_v_val,
@@ -1562,6 +1774,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O2 = {
 					n_dofs = 24,
 					dofs_per_entity = {.D0 = 0, .D1 = 3, .D2 = 12, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 12, .D3 = 24},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}},
+						.D1 = {{0, 1, 2}, {3, 4, 5}, {6, 7, 8}, {9, 10, 11}},
+						.D2 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23}},
+						.D3 = nil,
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_quad_nedelec_o2_v_val,
@@ -1670,39 +1889,39 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 			},
 			sub_entities = {
 				.D0 = {
-					{type = .Point, closure = {.D0 = {0}, .D1 = nil, .D2 = nil, .D3 = nil}},
-					{type = .Point, closure = {.D0 = {1}, .D1 = nil, .D2 = nil, .D3 = nil}},
-					{type = .Point, closure = {.D0 = {2}, .D1 = nil, .D2 = nil, .D3 = nil}},
-					{type = .Point, closure = {.D0 = {3}, .D1 = nil, .D2 = nil, .D3 = nil}},
-					{type = .Point, closure = {.D0 = {4}, .D1 = nil, .D2 = nil, .D3 = nil}},
-					{type = .Point, closure = {.D0 = {5}, .D1 = nil, .D2 = nil, .D3 = nil}},
-					{type = .Point, closure = {.D0 = {6}, .D1 = nil, .D2 = nil, .D3 = nil}},
-					{type = .Point, closure = {.D0 = {7}, .D1 = nil, .D2 = nil, .D3 = nil}},
+					{type = .Point, closure = {.D0 = {0}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {-1, -1, -1}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Point, closure = {.D0 = {1}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {1, -1, -1}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Point, closure = {.D0 = {2}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {-1, 1, -1}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Point, closure = {.D0 = {3}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {1, 1, -1}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Point, closure = {.D0 = {4}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {-1, -1, 1}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Point, closure = {.D0 = {5}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {1, -1, 1}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Point, closure = {.D0 = {6}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {-1, 1, 1}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Point, closure = {.D0 = {7}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {1, 1, 1}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
 				},
 				.D1 = {
-					{type = .Line, closure = {.D0 = {0, 1}, .D1 = {0}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {0, 2}, .D1 = {1}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {0, 4}, .D1 = {2}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {1, 3}, .D1 = {3}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {1, 5}, .D1 = {4}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {2, 3}, .D1 = {5}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {2, 6}, .D1 = {6}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {3, 7}, .D1 = {7}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {4, 5}, .D1 = {8}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {4, 6}, .D1 = {9}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {5, 7}, .D1 = {10}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {6, 7}, .D1 = {11}, .D2 = nil, .D3 = nil}},
+					{type = .Line, closure = {.D0 = {0, 1}, .D1 = {0}, .D2 = nil, .D3 = nil}, lift = {origin = {0, -1, -1}, jac = {{1, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {0, 2}, .D1 = {1}, .D2 = nil, .D3 = nil}, lift = {origin = {-1, 0, -1}, jac = {{0, 1, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {0, 4}, .D1 = {2}, .D2 = nil, .D3 = nil}, lift = {origin = {-1, -1, 0}, jac = {{0, 0, 1}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {1, 3}, .D1 = {3}, .D2 = nil, .D3 = nil}, lift = {origin = {1, 0, -1}, jac = {{0, 1, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {1, 5}, .D1 = {4}, .D2 = nil, .D3 = nil}, lift = {origin = {1, -1, 0}, jac = {{0, 0, 1}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {2, 3}, .D1 = {5}, .D2 = nil, .D3 = nil}, lift = {origin = {0, 1, -1}, jac = {{1, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {2, 6}, .D1 = {6}, .D2 = nil, .D3 = nil}, lift = {origin = {-1, 1, 0}, jac = {{0, 0, 1}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {3, 7}, .D1 = {7}, .D2 = nil, .D3 = nil}, lift = {origin = {1, 1, 0}, jac = {{0, 0, 1}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {4, 5}, .D1 = {8}, .D2 = nil, .D3 = nil}, lift = {origin = {0, -1, 1}, jac = {{1, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {4, 6}, .D1 = {9}, .D2 = nil, .D3 = nil}, lift = {origin = {-1, 0, 1}, jac = {{0, 1, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {5, 7}, .D1 = {10}, .D2 = nil, .D3 = nil}, lift = {origin = {1, 0, 1}, jac = {{0, 1, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {6, 7}, .D1 = {11}, .D2 = nil, .D3 = nil}, lift = {origin = {0, 1, 1}, jac = {{1, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
 				},
 				.D2 = {
-					{type = .Quad, closure = {.D0 = {0, 1, 2, 3}, .D1 = {0, 1, 3, 5}, .D2 = {0}, .D3 = nil}},
-					{type = .Quad, closure = {.D0 = {0, 1, 4, 5}, .D1 = {0, 2, 4, 8}, .D2 = {1}, .D3 = nil}},
-					{type = .Quad, closure = {.D0 = {0, 2, 4, 6}, .D1 = {1, 2, 6, 9}, .D2 = {2}, .D3 = nil}},
-					{type = .Quad, closure = {.D0 = {1, 3, 5, 7}, .D1 = {3, 4, 7, 10}, .D2 = {3}, .D3 = nil}},
-					{type = .Quad, closure = {.D0 = {2, 3, 6, 7}, .D1 = {5, 6, 7, 11}, .D2 = {4}, .D3 = nil}},
-					{type = .Quad, closure = {.D0 = {4, 5, 6, 7}, .D1 = {8, 9, 10, 11}, .D2 = {5}, .D3 = nil}},
+					{type = .Quad, closure = {.D0 = {0, 1, 2, 3}, .D1 = {0, 1, 3, 5}, .D2 = {0}, .D3 = nil}, lift = {origin = {0, 0, -1}, jac = {{1, 0, 0}, {0, 1, 0}, {0, 0, 0}}}},
+					{type = .Quad, closure = {.D0 = {0, 1, 4, 5}, .D1 = {0, 2, 4, 8}, .D2 = {1}, .D3 = nil}, lift = {origin = {0, -1, 0}, jac = {{1, 0, 0}, {0, 0, 1}, {0, 0, 0}}}},
+					{type = .Quad, closure = {.D0 = {0, 2, 4, 6}, .D1 = {1, 2, 6, 9}, .D2 = {2}, .D3 = nil}, lift = {origin = {-1, 0, 0}, jac = {{0, 1, 0}, {0, 0, 1}, {0, 0, 0}}}},
+					{type = .Quad, closure = {.D0 = {1, 3, 5, 7}, .D1 = {3, 4, 7, 10}, .D2 = {3}, .D3 = nil}, lift = {origin = {1, 0, 0}, jac = {{0, 1, 0}, {0, 0, 1}, {0, 0, 0}}}},
+					{type = .Quad, closure = {.D0 = {2, 3, 6, 7}, .D1 = {5, 6, 7, 11}, .D2 = {4}, .D3 = nil}, lift = {origin = {0, 1, 0}, jac = {{1, 0, 0}, {0, 0, 1}, {0, 0, 0}}}},
+					{type = .Quad, closure = {.D0 = {4, 5, 6, 7}, .D1 = {8, 9, 10, 11}, .D2 = {5}, .D3 = nil}, lift = {origin = {0, 0, 1}, jac = {{1, 0, 0}, {0, 1, 0}, {0, 0, 0}}}},
 				},
 				.D3 = {
-					{type = .Hex, closure = {.D0 = {0, 1, 2, 3, 4, 5, 6, 7}, .D1 = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, .D2 = {0, 1, 2, 3, 4, 5}, .D3 = {0}}},
+					{type = .Hex, closure = {.D0 = {0, 1, 2, 3, 4, 5, 6, 7}, .D1 = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, .D2 = {0, 1, 2, 3, 4, 5}, .D3 = {0}}, lift = {origin = {0, 0, 0}, jac = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}}},
 				},
 			},
 			facet_normals = {
@@ -1710,6 +1929,7 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				{0, 1, 0}, {0, 0, 1},
 			},
 			orientation_perms = nil,
+			orientation_maps = nil,
 		},
 		quadrature = {
 			.Q1 = {
@@ -1776,6 +1996,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O0 = {
 					n_dofs = 1,
 					dofs_per_entity = {.D0 = 0, .D1 = 0, .D2 = 0, .D3 = 1},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 0, .D3 = 0},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}, {}, {}, {}, {}},
+						.D1 = {{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}},
+						.D2 = {{}, {}, {}, {}, {}, {}},
+						.D3 = {{0}},
+					},
 					evals = {
 						.S_Val = ref_hex_lagrange_o0_s_val,
 						.V_Val = nil,
@@ -1806,6 +2033,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O1 = {
 					n_dofs = 8,
 					dofs_per_entity = {.D0 = 1, .D1 = 0, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 8, .D2 = 8, .D3 = 8},
+					closure_dofs = {
+						.D0 = {{0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}},
+						.D1 = {{0, 1}, {0, 2}, {0, 4}, {1, 3}, {1, 5}, {2, 3}, {2, 6}, {3, 7}, {4, 5}, {4, 6}, {5, 7}, {6, 7}},
+						.D2 = {{0, 1, 2, 3}, {0, 1, 4, 5}, {0, 2, 4, 6}, {1, 3, 5, 7}, {2, 3, 6, 7}, {4, 5, 6, 7}},
+						.D3 = {{0, 1, 2, 3, 4, 5, 6, 7}},
+					},
 					evals = {
 						.S_Val = ref_hex_lagrange_o1_s_val,
 						.V_Val = nil,
@@ -1864,6 +2098,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O2 = {
 					n_dofs = 27,
 					dofs_per_entity = {.D0 = 1, .D1 = 1, .D2 = 1, .D3 = 1},
+					entity_dof_start = {.D0 = 0, .D1 = 8, .D2 = 20, .D3 = 26},
+					closure_dofs = {
+						.D0 = {{0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}},
+						.D1 = {{0, 1, 8}, {0, 2, 9}, {0, 4, 10}, {1, 3, 11}, {1, 5, 12}, {2, 3, 13}, {2, 6, 14}, {3, 7, 15}, {4, 5, 16}, {4, 6, 17}, {5, 7, 18}, {6, 7, 19}},
+						.D2 = {{0, 1, 2, 3, 8, 9, 11, 13, 20}, {0, 1, 4, 5, 8, 10, 12, 16, 21}, {0, 2, 4, 6, 9, 10, 14, 17, 22}, {1, 3, 5, 7, 11, 12, 15, 18, 23}, {2, 3, 6, 7, 13, 14, 15, 19, 24}, {4, 5, 6, 7, 16, 17, 18, 19, 25}},
+						.D3 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26}},
+					},
 					evals = {
 						.S_Val = ref_hex_lagrange_o2_s_val,
 						.V_Val = nil,
@@ -2001,6 +2242,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O3 = {
 					n_dofs = 64,
 					dofs_per_entity = {.D0 = 1, .D1 = 2, .D2 = 4, .D3 = 8},
+					entity_dof_start = {.D0 = 0, .D1 = 8, .D2 = 32, .D3 = 56},
+					closure_dofs = {
+						.D0 = {{0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}},
+						.D1 = {{0, 1, 8, 9}, {0, 2, 10, 11}, {0, 4, 12, 13}, {1, 3, 14, 15}, {1, 5, 16, 17}, {2, 3, 18, 19}, {2, 6, 20, 21}, {3, 7, 22, 23}, {4, 5, 24, 25}, {4, 6, 26, 27}, {5, 7, 28, 29}, {6, 7, 30, 31}},
+						.D2 = {{0, 1, 2, 3, 8, 9, 10, 11, 14, 15, 18, 19, 32, 33, 34, 35}, {0, 1, 4, 5, 8, 9, 12, 13, 16, 17, 24, 25, 36, 37, 38, 39}, {0, 2, 4, 6, 10, 11, 12, 13, 20, 21, 26, 27, 40, 41, 42, 43}, {1, 3, 5, 7, 14, 15, 16, 17, 22, 23, 28, 29, 44, 45, 46, 47}, {2, 3, 6, 7, 18, 19, 20, 21, 22, 23, 30, 31, 48, 49, 50, 51}, {4, 5, 6, 7, 24, 25, 26, 27, 28, 29, 30, 31, 52, 53, 54, 55}},
+						.D3 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63}},
+					},
 					evals = {
 						.S_Val = ref_hex_lagrange_o3_s_val,
 						.V_Val = nil,
@@ -2182,6 +2430,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O0 = {
 					n_dofs = 6,
 					dofs_per_entity = {.D0 = 0, .D1 = 0, .D2 = 1, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 0, .D3 = 6},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}, {}, {}, {}, {}},
+						.D1 = {{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}},
+						.D2 = {{0}, {1}, {2}, {3}, {4}, {5}},
+						.D3 = {{0, 1, 2, 3, 4, 5}},
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_hex_raviart_thomas_o0_v_val,
@@ -2241,6 +2496,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O1 = {
 					n_dofs = 36,
 					dofs_per_entity = {.D0 = 0, .D1 = 0, .D2 = 4, .D3 = 12},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 0, .D3 = 24},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}, {}, {}, {}, {}},
+						.D1 = {{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}},
+						.D2 = {{0, 1, 2, 3}, {4, 5, 6, 7}, {8, 9, 10, 11}, {12, 13, 14, 15}, {16, 17, 18, 19}, {20, 21, 22, 23}},
+						.D3 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35}},
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_hex_raviart_thomas_o1_v_val,
@@ -2387,6 +2649,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O2 = {
 					n_dofs = 108,
 					dofs_per_entity = {.D0 = 0, .D1 = 0, .D2 = 9, .D3 = 54},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 0, .D3 = 54},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}, {}, {}, {}, {}},
+						.D1 = {{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}},
+						.D2 = {{0, 1, 2, 3, 4, 5, 6, 7, 8}, {9, 10, 11, 12, 13, 14, 15, 16, 17}, {18, 19, 20, 21, 22, 23, 24, 25, 26}, {27, 28, 29, 30, 31, 32, 33, 34, 35}, {36, 37, 38, 39, 40, 41, 42, 43, 44}, {45, 46, 47, 48, 49, 50, 51, 52, 53}},
+						.D3 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107}},
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_hex_raviart_thomas_o2_v_val,
@@ -3247,6 +3516,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O0 = {
 					n_dofs = 12,
 					dofs_per_entity = {.D0 = 0, .D1 = 1, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 12, .D3 = 12},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}, {}, {}, {}, {}},
+						.D1 = {{0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {9}, {10}, {11}},
+						.D2 = {{0, 1, 3, 5}, {0, 2, 4, 8}, {1, 2, 6, 9}, {3, 4, 7, 10}, {5, 6, 7, 11}, {8, 9, 10, 11}},
+						.D3 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}},
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_hex_nedelec_o0_v_val,
@@ -3324,6 +3600,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O1 = {
 					n_dofs = 54,
 					dofs_per_entity = {.D0 = 0, .D1 = 2, .D2 = 4, .D3 = 6},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 24, .D3 = 48},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}, {}, {}, {}, {}},
+						.D1 = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {8, 9}, {10, 11}, {12, 13}, {14, 15}, {16, 17}, {18, 19}, {20, 21}, {22, 23}},
+						.D2 = {{0, 1, 2, 3, 6, 7, 10, 11, 24, 25, 26, 27}, {0, 1, 4, 5, 8, 9, 16, 17, 28, 29, 30, 31}, {2, 3, 4, 5, 12, 13, 18, 19, 32, 33, 34, 35}, {6, 7, 8, 9, 14, 15, 20, 21, 36, 37, 38, 39}, {10, 11, 12, 13, 14, 15, 22, 23, 40, 41, 42, 43}, {16, 17, 18, 19, 20, 21, 22, 23, 44, 45, 46, 47}},
+						.D3 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53}},
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_hex_nedelec_o1_v_val,
@@ -3540,6 +3823,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O2 = {
 					n_dofs = 144,
 					dofs_per_entity = {.D0 = 0, .D1 = 3, .D2 = 12, .D3 = 36},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 36, .D3 = 108},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}, {}, {}, {}, {}},
+						.D1 = {{0, 1, 2}, {3, 4, 5}, {6, 7, 8}, {9, 10, 11}, {12, 13, 14}, {15, 16, 17}, {18, 19, 20}, {21, 22, 23}, {24, 25, 26}, {27, 28, 29}, {30, 31, 32}, {33, 34, 35}},
+						.D2 = {{0, 1, 2, 3, 4, 5, 9, 10, 11, 15, 16, 17, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47}, {0, 1, 2, 6, 7, 8, 12, 13, 14, 24, 25, 26, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59}, {3, 4, 5, 6, 7, 8, 18, 19, 20, 27, 28, 29, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71}, {9, 10, 11, 12, 13, 14, 21, 22, 23, 30, 31, 32, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83}, {15, 16, 17, 18, 19, 20, 21, 22, 23, 33, 34, 35, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95}, {24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107}},
+						.D3 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143}},
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_hex_nedelec_o2_v_val,
@@ -4394,31 +4684,32 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 			vertices = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}},
 			sub_entities = {
 				.D0 = {
-					{type = .Point, closure = {.D0 = {0}, .D1 = nil, .D2 = nil, .D3 = nil}},
-					{type = .Point, closure = {.D0 = {1}, .D1 = nil, .D2 = nil, .D3 = nil}},
-					{type = .Point, closure = {.D0 = {2}, .D1 = nil, .D2 = nil, .D3 = nil}},
-					{type = .Point, closure = {.D0 = {3}, .D1 = nil, .D2 = nil, .D3 = nil}},
+					{type = .Point, closure = {.D0 = {0}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {0, 0, 0}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Point, closure = {.D0 = {1}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {1, 0, 0}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Point, closure = {.D0 = {2}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {0, 1, 0}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Point, closure = {.D0 = {3}, .D1 = nil, .D2 = nil, .D3 = nil}, lift = {origin = {0, 0, 1}, jac = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
 				},
 				.D1 = {
-					{type = .Line, closure = {.D0 = {2, 3}, .D1 = {0}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {1, 3}, .D1 = {1}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {1, 2}, .D1 = {2}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {0, 3}, .D1 = {3}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {0, 2}, .D1 = {4}, .D2 = nil, .D3 = nil}},
-					{type = .Line, closure = {.D0 = {0, 1}, .D1 = {5}, .D2 = nil, .D3 = nil}},
+					{type = .Line, closure = {.D0 = {2, 3}, .D1 = {0}, .D2 = nil, .D3 = nil}, lift = {origin = {0, 0.5, 0.5}, jac = {{0, -0.5, 0.5}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {1, 3}, .D1 = {1}, .D2 = nil, .D3 = nil}, lift = {origin = {0.5, 0, 0.5}, jac = {{-0.5, 0, 0.5}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {1, 2}, .D1 = {2}, .D2 = nil, .D3 = nil}, lift = {origin = {0.5, 0.5, 0}, jac = {{-0.5, 0.5, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {0, 3}, .D1 = {3}, .D2 = nil, .D3 = nil}, lift = {origin = {0, 0, 0.5}, jac = {{0, 0, 0.5}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {0, 2}, .D1 = {4}, .D2 = nil, .D3 = nil}, lift = {origin = {0, 0.5, 0}, jac = {{0, 0.5, 0}, {0, 0, 0}, {0, 0, 0}}}},
+					{type = .Line, closure = {.D0 = {0, 1}, .D1 = {5}, .D2 = nil, .D3 = nil}, lift = {origin = {0.5, 0, 0}, jac = {{0.5, 0, 0}, {0, 0, 0}, {0, 0, 0}}}},
 				},
 				.D2 = {
-					{type = .Tri, closure = {.D0 = {1, 2, 3}, .D1 = {0, 1, 2}, .D2 = {0}, .D3 = nil}},
-					{type = .Tri, closure = {.D0 = {0, 2, 3}, .D1 = {0, 3, 4}, .D2 = {1}, .D3 = nil}},
-					{type = .Tri, closure = {.D0 = {0, 1, 3}, .D1 = {1, 3, 5}, .D2 = {2}, .D3 = nil}},
-					{type = .Tri, closure = {.D0 = {0, 1, 2}, .D1 = {2, 4, 5}, .D2 = {3}, .D3 = nil}},
+					{type = .Tri, closure = {.D0 = {1, 2, 3}, .D1 = {0, 1, 2}, .D2 = {0}, .D3 = nil}, lift = {origin = {1, 0, 0}, jac = {{-1, 1, 0}, {-1, 0, 1}, {0, 0, 0}}}},
+					{type = .Tri, closure = {.D0 = {0, 2, 3}, .D1 = {0, 3, 4}, .D2 = {1}, .D3 = nil}, lift = {origin = {0, 0, 0}, jac = {{0, 1, 0}, {0, 0, 1}, {0, 0, 0}}}},
+					{type = .Tri, closure = {.D0 = {0, 1, 3}, .D1 = {1, 3, 5}, .D2 = {2}, .D3 = nil}, lift = {origin = {0, 0, 0}, jac = {{1, 0, 0}, {0, 0, 1}, {0, 0, 0}}}},
+					{type = .Tri, closure = {.D0 = {0, 1, 2}, .D1 = {2, 4, 5}, .D2 = {3}, .D3 = nil}, lift = {origin = {0, 0, 0}, jac = {{1, 0, 0}, {0, 1, 0}, {0, 0, 0}}}},
 				},
 				.D3 = {
-					{type = .Tet, closure = {.D0 = {0, 1, 2, 3}, .D1 = {0, 1, 2, 3, 4, 5}, .D2 = {0, 1, 2, 3}, .D3 = {0}}},
+					{type = .Tet, closure = {.D0 = {0, 1, 2, 3}, .D1 = {0, 1, 2, 3, 4, 5}, .D2 = {0, 1, 2, 3}, .D3 = {0}}, lift = {origin = {0, 0, 0}, jac = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}}},
 				},
 			},
 			facet_normals = {{1, 1, 1}, {-1, 0, 0}, {0, -1, 0}, {0, 0, -1}},
 			orientation_perms = nil,
+			orientation_maps = nil,
 		},
 		quadrature = {
 			.Q1 = {
@@ -4513,6 +4804,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O0 = {
 					n_dofs = 1,
 					dofs_per_entity = {.D0 = 0, .D1 = 0, .D2 = 0, .D3 = 1},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 0, .D3 = 0},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}},
+						.D1 = {{}, {}, {}, {}, {}, {}},
+						.D2 = {{}, {}, {}, {}},
+						.D3 = {{0}},
+					},
 					evals = {
 						.S_Val = ref_tet_lagrange_o0_s_val,
 						.V_Val = nil,
@@ -4543,6 +4841,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O1 = {
 					n_dofs = 4,
 					dofs_per_entity = {.D0 = 1, .D1 = 0, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 4, .D2 = 4, .D3 = 4},
+					closure_dofs = {
+						.D0 = {{0}, {1}, {2}, {3}},
+						.D1 = {{2, 3}, {1, 3}, {1, 2}, {0, 3}, {0, 2}, {0, 1}},
+						.D2 = {{1, 2, 3}, {0, 2, 3}, {0, 1, 3}, {0, 1, 2}},
+						.D3 = {{0, 1, 2, 3}},
+					},
 					evals = {
 						.S_Val = ref_tet_lagrange_o1_s_val,
 						.V_Val = nil,
@@ -4585,6 +4890,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O2 = {
 					n_dofs = 10,
 					dofs_per_entity = {.D0 = 1, .D1 = 1, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 4, .D2 = 10, .D3 = 10},
+					closure_dofs = {
+						.D0 = {{0}, {1}, {2}, {3}},
+						.D1 = {{2, 3, 4}, {1, 3, 5}, {1, 2, 6}, {0, 3, 7}, {0, 2, 8}, {0, 1, 9}},
+						.D2 = {{1, 2, 3, 4, 5, 6}, {0, 2, 3, 4, 7, 8}, {0, 1, 3, 5, 7, 9}, {0, 1, 2, 6, 8, 9}},
+						.D3 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}},
+					},
 					evals = {
 						.S_Val = ref_tet_lagrange_o2_s_val,
 						.V_Val = nil,
@@ -4652,6 +4964,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O3 = {
 					n_dofs = 20,
 					dofs_per_entity = {.D0 = 1, .D1 = 2, .D2 = 1, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 4, .D2 = 16, .D3 = 20},
+					closure_dofs = {
+						.D0 = {{0}, {1}, {2}, {3}},
+						.D1 = {{2, 3, 4, 5}, {1, 3, 6, 7}, {1, 2, 8, 9}, {0, 3, 10, 11}, {0, 2, 12, 13}, {0, 1, 14, 15}},
+						.D2 = {{1, 2, 3, 4, 5, 6, 7, 8, 9, 16}, {0, 2, 3, 4, 5, 10, 11, 12, 13, 17}, {0, 1, 3, 6, 7, 10, 11, 14, 15, 18}, {0, 1, 2, 8, 9, 12, 13, 14, 15, 19}},
+						.D3 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}},
+					},
 					evals = {
 						.S_Val = ref_tet_lagrange_o3_s_val,
 						.V_Val = nil,
@@ -4741,6 +5060,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O0 = {
 					n_dofs = 4,
 					dofs_per_entity = {.D0 = 0, .D1 = 0, .D2 = 1, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 0, .D3 = 4},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}},
+						.D1 = {{}, {}, {}, {}, {}, {}},
+						.D2 = {{0}, {1}, {2}, {3}},
+						.D3 = {{0, 1, 2, 3}},
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_tet_raviart_thomas_o0_v_val,
@@ -4790,6 +5116,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O1 = {
 					n_dofs = 15,
 					dofs_per_entity = {.D0 = 0, .D1 = 0, .D2 = 3, .D3 = 3},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 0, .D3 = 12},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}},
+						.D1 = {{}, {}, {}, {}, {}, {}},
+						.D2 = {{0, 1, 2}, {3, 4, 5}, {6, 7, 8}, {9, 10, 11}},
+						.D3 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}},
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_tet_raviart_thomas_o1_v_val,
@@ -4916,6 +5249,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O2 = {
 					n_dofs = 36,
 					dofs_per_entity = {.D0 = 0, .D1 = 0, .D2 = 6, .D3 = 12},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 0, .D3 = 24},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}},
+						.D1 = {{}, {}, {}, {}, {}, {}},
+						.D2 = {{0, 1, 2, 3, 4, 5}, {6, 7, 8, 9, 10, 11}, {12, 13, 14, 15, 16, 17}, {18, 19, 20, 21, 22, 23}},
+						.D3 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35}},
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_tet_raviart_thomas_o2_v_val,
@@ -5331,6 +5671,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O0 = {
 					n_dofs = 6,
 					dofs_per_entity = {.D0 = 0, .D1 = 1, .D2 = 0, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 6, .D3 = 6},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}},
+						.D1 = {{0}, {1}, {2}, {3}, {4}, {5}},
+						.D2 = {{0, 1, 2}, {0, 3, 4}, {1, 3, 5}, {2, 4, 5}},
+						.D3 = {{0, 1, 2, 3, 4, 5}},
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_tet_nedelec_o0_v_val,
@@ -5384,6 +5731,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O1 = {
 					n_dofs = 20,
 					dofs_per_entity = {.D0 = 0, .D1 = 2, .D2 = 2, .D3 = 0},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 12, .D3 = 20},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}},
+						.D1 = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {8, 9}, {10, 11}},
+						.D2 = {{0, 1, 2, 3, 4, 5, 12, 13}, {0, 1, 6, 7, 8, 9, 14, 15}, {2, 3, 6, 7, 10, 11, 16, 17}, {4, 5, 8, 9, 10, 11, 18, 19}},
+						.D3 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}},
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_tet_nedelec_o1_v_val,
@@ -5531,6 +5885,13 @@ REFERENCE_ELEMENTS := [Element_Type]Reference_Element{
 				.O2 = {
 					n_dofs = 45,
 					dofs_per_entity = {.D0 = 0, .D1 = 3, .D2 = 6, .D3 = 3},
+					entity_dof_start = {.D0 = 0, .D1 = 0, .D2 = 18, .D3 = 42},
+					closure_dofs = {
+						.D0 = {{}, {}, {}, {}},
+						.D1 = {{0, 1, 2}, {3, 4, 5}, {6, 7, 8}, {9, 10, 11}, {12, 13, 14}, {15, 16, 17}},
+						.D2 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 18, 19, 20, 21, 22, 23}, {0, 1, 2, 9, 10, 11, 12, 13, 14, 24, 25, 26, 27, 28, 29}, {3, 4, 5, 9, 10, 11, 15, 16, 17, 30, 31, 32, 33, 34, 35}, {6, 7, 8, 12, 13, 14, 15, 16, 17, 36, 37, 38, 39, 40, 41}},
+						.D3 = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44}},
+					},
 					evals = {
 						.S_Val = nil,
 						.V_Val = ref_tet_nedelec_o2_v_val,

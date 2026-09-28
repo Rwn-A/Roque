@@ -56,7 +56,7 @@
 
 namespace amgcl_c {
 
-using Backend = amgcl::backend::builtin<double>;
+using Backend = amgcl::backend::builtin<double, int, int>; // 32-bit indices, the same as the Odin side
 
 //===========================================================================
 // Generic "one of these types, picked at runtime" machinery

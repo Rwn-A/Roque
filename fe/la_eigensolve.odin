@@ -1,7 +1,7 @@
 package fe
 
 /*
- Solution algorithm for the eigenvalue problem (K - lambda^2 M)x = 0
+ Solution algorithm for the generalized eigenproblem K v = lambda M v, lambda = omega^2.
 */
 
 import "core:math"
@@ -19,20 +19,18 @@ Lanczos_Result :: struct {
 	converged: int, // number of Lanczos steps actually completed
 }
 
-// Finds the lowest natural frequencies and mode shapes of the
-// generalized eigenproblem K v = lambda M v.
+// Finds the lowest natural frequencies (Hz, omega / 2pi) and mode shapes of K v = lambda M v.
 // `subspace_dim` size of the Krylov basis to build, increase for more eigen pairs but at higher cost.
-// `shift` shifts the eigensolve to a particualr region, choose closest to your frequencies of interest.
-// returned eigen values & vectors are in order lowest to highest. Frequency is divided out by 2pi.
-// `precond_params` / `solver_params`: nil uses `lanczos_precond_params` / `lanczos_solver_params`.
+// `shift` shifts the eigensolve to a particular region (in lambda), choose it closest to the modes of interest.
+// The first min(result.converged, len(frequencies)) frequencies and vectors are filled, lowest to highest.
 inexact_shift_lanczos :: proc(
 	K, M: Sparse_Matrix,
 	subspace_dim: int,
-	eigen_values: []f64,
+	frequencies: []f64,
 	eigen_vectors: []Vector,
 	shift: f64 = 0.0,
-	precond_params: Maybe(Precond_Params) = nil,
-	solver_params: Maybe(Solver_Params) = nil,
+	precond_params := PRECOND_DEFAULT,
+	solver_params := SOLVER_DEFAULT,
 ) -> Lanczos_Result {
 	LANCZOS_BREAKDOWN_TOL :: 1e-25
 	ORTHO_PASSES :: 2
@@ -44,14 +42,11 @@ inexact_shift_lanczos :: proc(
 	TRIDIAGONAL_PIVOT_EPSILON :: 1e-14
 	EIGENVECTOR_NORM_FLOOR :: 1e-30
 
+	assert(len(eigen_vectors) == len(frequencies), "one eigen vector per frequency")
 	scratch_guard()
 	context.allocator = scratch()
 
 	N := sp_n_rows(K.sp)
-	assert(len(K.values) == len(M.values), "K and M must share a sparsity pattern")
-
-	precond_prm := precond_params.? or_else lanczos_precond_params()
-	solver_prm := solver_params.? or_else lanczos_solver_params()
 
 	subspace_dim := subspace_dim
 	if subspace_dim > N { subspace_dim = N }
@@ -64,12 +59,9 @@ inexact_shift_lanczos :: proc(
 	z := make([]f64, N)
 	q := make([]f64, N)
 	w := make([]f64, N)
+	dots := make([]f64, subspace_dim)
 
-	K_shifted := sparse_from_sparsity(K.sp)
-
-	for idx in 0 ..< len(K.values) {
-		K_shifted.values[idx] = K.values[idx] - shift * M.values[idx]
-	}
+	K_shifted := sp_sum(K, M, 1, -shift)
 
 	reference_scale := 0.0
 	for i in 0 ..< N {
@@ -78,7 +70,7 @@ inexact_shift_lanczos :: proc(
 		}
 	}
 
-	precond, ok := amgcl_precond_create(K_shifted, precond_prm)
+	precond, ok := amgcl_precond_create(K_shifted, precond_params)
 	if !ok { return Lanczos_Result{status = .Preconditioner_Failed} }
 	defer amgcl_precond_destroy(precond)
 
@@ -93,7 +85,7 @@ inexact_shift_lanczos :: proc(
 
 		sp_gemv(M, V[j], q)
 
-		if amgcl_result := amgcl_solve(precond, q, z, solver_prm); amgcl_result.status != .Converged {
+		if amgcl_result := amgcl_solve(precond, q, z, solver_params); amgcl_result.status != .Converged {
 			status = .Linear_Solve_Failed; actual_m -= 1
 			break
 		}
@@ -107,12 +99,11 @@ inexact_shift_lanczos :: proc(
 			}
 		}
 
-		for pass in 0 ..< ORTHO_PASSES {
-			for p in 0 ..< j {
-				sp_gemv(M, V[p], q)
-				dot := vec_dot(w, q)
-				vec_axpy(V[p], w, -dot)
-			}
+		// classical Gram-Schmidt in the M inner product, twice: one M product per pass
+		for _ in 0 ..< ORTHO_PASSES {
+			sp_gemv(M, w, q)
+			for p in 0 ..< j { dots[p] = vec_dot(q, V[p]) }
+			for p in 0 ..< j { vec_axpy(V[p], w, -dots[p]) }
 		}
 
 		w_nrm := math.sqrt(sp_inner(M, w, w))
@@ -136,29 +127,29 @@ inexact_shift_lanczos :: proc(
 	Y := make([][]f64, actual_m)
 	for i in 0 ..< actual_m { Y[i] = make([]f64, actual_m) }
 
-	symmetric_tridiagonal_qr(valid_alpha, valid_beta, Y)
+	tridiagonal_eigen(valid_alpha, valid_beta, Y)
 
-	for k in 0 ..< actual_m {
-		if k >= len(eigen_values) { break }
-		true_eigenvalue := shift + (1.0 / valid_alpha[k])
-		omega := math.sqrt(true_eigenvalue)
-		eigen_values[k] = omega / (2.0 * math.PI)
+	n := min(actual_m, len(frequencies))
+	for k in 0 ..< n {
+		lambda := shift + (1.0 / valid_alpha[k])
+		frequencies[k] = math.sqrt(lambda) / (2.0 * math.PI)
 	}
 
 	for i in 0 ..< N {
-		for k in 0 ..< actual_m {
+		for k in 0 ..< n {
 			sum := 0.0
 			for j in 0 ..< actual_m { sum += V[j][i] * Y[k][j] }
-			if k < len(eigen_vectors) { eigen_vectors[k][i] = sum }
+			eigen_vectors[k][i] = sum
 		}
 	}
 
-	perm := slice.sort_with_indices(eigen_values)
-	slice.sort_from_permutation_indices(eigen_vectors, perm)
+	perm := slice.sort_with_indices(frequencies[:n])
+	slice.sort_from_permutation_indices(eigen_vectors[:n], perm)
 
 	return Lanczos_Result{status = status, converged = actual_m}
 
-	symmetric_tridiagonal_qr :: proc(d: []f64, e_input: []f64, Y: [][]f64) {
+	// Eigenvalues of the tridiagonal (d, e_input) by bisection into d, eigenvectors by inverse iteration into Y.
+	tridiagonal_eigen :: proc(d: []f64, e_input: []f64, Y: [][]f64) {
 		m := len(d)
 		if m <= 1 { return }
 
@@ -246,21 +237,5 @@ inexact_shift_lanczos :: proc(
 			if ratio < 0.0 { count += 1 }
 		}
 		return count
-	}
-
-	lanczos_precond_params :: proc() -> (p: Precond_Params) {
-		amgcl_precond_params_default(&p)
-		p.class = .AMG
-		p.amg.coarsening.kind = .Smoothed_Aggregation
-		p.amg.relax.kind = .Gauss_Seidel
-		return
-	}
-
-	lanczos_solver_params :: proc() -> (p: Solver_Params) {
-		amgcl_solver_params_default(&p)
-		p.kind = .BiCGStab
-		p.tol = 1e-8
-		p.maxiter = 500
-		return
 	}
 }

@@ -4,10 +4,8 @@ import "core:fmt"
 import "core:io"
 import "core:log"
 import "core:mem"
-import "core:mem/virtual"
 import "core:os"
 import "core:path/filepath"
-import "core:slice"
 import "core:strconv"
 
 import fe "../"
@@ -19,7 +17,6 @@ VTU_Config :: struct {
 VTU_Writer :: struct {
 	viz_mesh:   VTU_Mesh,
 	cfg:        VTU_Config,
-	arena:      virtual.Arena,
 	pvd_fd:     ^os.File,
 	pvd_writer: XML_Writer,
 }
@@ -29,7 +26,6 @@ VTU_Mesh :: struct {
 	connectivity: []i32,
 	offsets:      []i32,
 	types:        []u8,
-	output_order: fe.Order,
 }
 
 VTK_Element_Type :: enum u8 {
@@ -51,21 +47,13 @@ VTK_ELEMENT_TYPE_FROM_NATIVE := [fe.Element_Type]VTK_Element_Type {
 	.Hex   = .Hexahedron,
 }
 
-vtu_output_writer :: proc(
-	mesh: fe.Mesh,
-	order: fe.Order,
-	coord_space: ^fe.Space,
-	coords: []f64,
-	cfg: VTU_Config,
-) -> ^VTU_Writer {
-	w, err := virtual.arena_growing_bootstrap_new_by_name(VTU_Writer, "arena")
-
-	if err != nil { log.panic("Could not create arena.") }
-
-	context.allocator = virtual.arena_allocator(&w.arena)
+// Vertices are every cell's rule points, cell after cell, matching the Output_Writer's points.
+vtu_create :: proc(mesh: fe.Mesh, geo: fe.Geometry, order: fe.Order, rules: Output_Rules, cfg: VTU_Config, alloc: mem.Allocator) -> ^VTU_Writer {
+	context.allocator = alloc
 	context.temp_allocator = fe.scratch()
 	fe.scratch_guard()
 
+	w := new(VTU_Writer)
 	w.cfg = cfg
 
 	if pvd_path, has := cfg.pvd_path.?; has {
@@ -89,24 +77,17 @@ vtu_output_writer :: proc(
 	offsets := make([dynamic]i32)
 	types := make([dynamic]u8)
 
-	for cell, i in mesh.cells {
+	for cell in mesh.cells {
 		fe.scratch_guard()
+		rule := rules[cell.type]
 
-		rule := fe.Rule {
-			points  = SUBCELLS[cell.type][order].points,
-			element = cell.type,
-		}
-
-		basis := fe.bstore_interior(fe.space_bd(coord_space, cell.type), rule)
-		elem_coords := fe.space_gather(f64, {coord_space, coords}, cell.id, context.temp_allocator)
-
-		phys_points := fe.pvec_create(f64, len(rule.points), 1, coord_space.fields, context.temp_allocator)
-
-		// Because contractions need compile-time dims
-		switch coord_space.fields {
-		case 1: fe.contract_eval(1, 1, phys_points, elem_coords, basis[.S_Val])
-		case 2: fe.contract_eval(1, 2, phys_points, elem_coords, basis[.S_Val])
-		case 3: fe.contract_eval(1, 3, phys_points, elem_coords, basis[.S_Val])
+		// geo_points needs the dimension at compile time
+		site := fe.cell_site(cell)
+		phys_points: fe.Pvec(f64)
+		switch geo.sc.space.fields {
+		case 1: phys_points = fe.geo_points(1, geo, site, rule, context.temp_allocator)
+		case 2: phys_points = fe.geo_points(2, geo, site, rule, context.temp_allocator)
+		case 3: phys_points = fe.geo_points(3, geo, site, rule, context.temp_allocator)
 		case: unreachable()
 		}
 
@@ -119,9 +100,8 @@ vtu_output_writer :: proc(
 			append(&vertices, padded_point)
 		}
 
-
-		for subcell in SUBCELLS[cell.type][order].connectivity {
-			for node_index in subcell { append(&connectivity, base_vertex_idx + i32(node_index)) }
+		for sub in SUBCELLS[cell.type][order].connectivity {
+			for node_index in sub { append(&connectivity, base_vertex_idx + i32(node_index)) }
 			append(&offsets, i32(len(connectivity)))
 			append(&types, u8(VTK_ELEMENT_TYPE_FROM_NATIVE[cell.type]))
 		}
@@ -132,9 +112,7 @@ vtu_output_writer :: proc(
 		connectivity = connectivity[:],
 		offsets      = offsets[:],
 		types        = types[:],
-		output_order = order,
 	}
-
 	return w
 }
 
@@ -148,13 +126,8 @@ vtu_write :: proc(w: ^VTU_Writer, req: Write_Request) -> bool {
 	context.allocator = fe.scratch()
 	fe.scratch_guard()
 
-	number_conversion_buffer: [32]u8
-	step_str: string
-	if step, has := req.step.?; has {
-		step_str = strconv.write_int(number_conversion_buffer[:], i64(step), 10)
-	}
-
-	path := fmt.aprintf("%s_%s.vtu", req.path, step_str)
+	path := fmt.aprintf("%s.vtu", req.path)
+	if step, has := req.step.?; has { path = fmt.aprintf("%s_%d.vtu", req.path, step) }
 
 	fd, err := os.open(path, {.Read, .Write, .Create, .Trunc})
 
@@ -169,7 +142,21 @@ vtu_write :: proc(w: ^VTU_Writer, req: Write_Request) -> bool {
 		w = io.to_writer(os.to_writer(fd)),
 	}
 
-	vtu_mesh := w.viz_mesh
+	vm := w.viz_mesh
+
+	// appended blocks are a u64 byte count then the bytes, offsets known up front so the data streams to the file
+	blocks := make([dynamic][]u8)
+	append(&blocks, mem.slice_to_bytes(vm.vertices))
+	append(&blocks, mem.slice_to_bytes(vm.connectivity))
+	append(&blocks, mem.slice_to_bytes(vm.offsets))
+	append(&blocks, mem.slice_to_bytes(vm.types))
+	for field in req.fields { append(&blocks, mem.slice_to_bytes(field.data)) }
+	block_offsets := make([]string, len(blocks))
+	at := 0
+	for b, i in blocks {
+		block_offsets[i] = fmt.aprintf("%d", at)
+		at += 8 + len(b)
+	}
 
 	xml_writer_write_string(&xml_w, "<?xml version=\"1.0\"?>\n")
 
@@ -180,56 +167,46 @@ vtu_write :: proc(w: ^VTU_Writer, req: Write_Request) -> bool {
 	)
 	defer xml_close_tag(&xml_w)
 
-	b0, b1: [32]u8
-	num_points := strconv.write_int(b0[:], cast(i64)len(vtu_mesh.vertices), 10)
-	num_cells := strconv.write_int(b1[:], cast(i64)len(vtu_mesh.offsets), 10)
+	num_points := fmt.aprintf("%d", len(vm.vertices))
+	num_cells := fmt.aprintf("%d", len(vm.offsets))
 
 	xml_open_tag(&xml_w, .UnstructuredGrid)
 	xml_open_tag(&xml_w, .Piece, {{"NumberOfPoints", num_points}, {"NumberOfCells", num_cells}})
-
-	appended := make([dynamic]u8)
-	defer delete(appended)
 
 	{
 		xml_open_tag(&xml_w, .Points)
 		defer xml_close_tag(&xml_w)
 
-		offset := appended_write(&appended, mem.slice_to_bytes(vtu_mesh.vertices))
-
 		xml_open_tag(
 			&xml_w,
 			.DataArray,
-			{{"type", "Float64"}, {"NumberOfComponents", "3"}, {"format", "appended"}, {"offset", offset}},
+			{{"type", "Float64"}, {"NumberOfComponents", "3"}, {"format", "appended"}, {"offset", block_offsets[0]}},
 		)
-		defer xml_close_tag(&xml_w)
+		xml_close_tag(&xml_w)
 	}
 
 	{
 		xml_open_tag(&xml_w, .Cells)
 		defer xml_close_tag(&xml_w)
 
-		offset_connectivity := appended_write(&appended, mem.slice_to_bytes(vtu_mesh.connectivity))
-
 		xml_open_tag(
 			&xml_w,
 			.DataArray,
-			{{"type", "Int32"}, {"Name", "connectivity"}, {"format", "appended"}, {"offset", offset_connectivity}},
+			{{"type", "Int32"}, {"Name", "connectivity"}, {"format", "appended"}, {"offset", block_offsets[1]}},
 		)
 		xml_close_tag(&xml_w)
 
-		offset_offsets := appended_write(&appended, mem.slice_to_bytes(vtu_mesh.offsets))
 		xml_open_tag(
 			&xml_w,
 			.DataArray,
-			{{"type", "Int32"}, {"Name", "offsets"}, {"format", "appended"}, {"offset", offset_offsets}},
+			{{"type", "Int32"}, {"Name", "offsets"}, {"format", "appended"}, {"offset", block_offsets[2]}},
 		)
 		xml_close_tag(&xml_w)
 
-		offset_types := appended_write(&appended, mem.slice_to_bytes(vtu_mesh.types))
 		xml_open_tag(
 			&xml_w,
 			.DataArray,
-			{{"type", "UInt8"}, {"Name", "types"}, {"format", "appended"}, {"offset", offset_types}},
+			{{"type", "UInt8"}, {"Name", "types"}, {"format", "appended"}, {"offset", block_offsets[3]}},
 		)
 		xml_close_tag(&xml_w)
 	}
@@ -239,10 +216,7 @@ vtu_write :: proc(w: ^VTU_Writer, req: Write_Request) -> bool {
 		xml_open_tag(&xml_w, .PointData)
 		defer xml_close_tag(&xml_w)
 
-		for field in req.fields {
-			data_offset := appended_write_chunks(&appended, field.data)
-
-			str_components := strconv.write_int(b0[:], cast(i64)field.value_components, 10)
+		for field, i in req.fields {
 			xml_open_tag(
 				&xml_w,
 				.DataArray,
@@ -250,8 +224,8 @@ vtu_write :: proc(w: ^VTU_Writer, req: Write_Request) -> bool {
 					{"type", "Float64"},
 					{"Name", field.name},
 					{"format", "appended"},
-					{"NumberOfComponents", str_components},
-					{"offset", data_offset},
+					{"NumberOfComponents", fmt.aprintf("%d", field.n_cmpnts)},
+					{"offset", block_offsets[4 + i]},
 				},
 			)
 			xml_close_tag(&xml_w)
@@ -259,11 +233,15 @@ vtu_write :: proc(w: ^VTU_Writer, req: Write_Request) -> bool {
 	}
 
 	xml_close_tag(&xml_w) // close piece
-	xml_close_tag(&xml_w) // close unstructered grid
+	xml_close_tag(&xml_w) // close unstructured grid
 
 	xml_open_tag(&xml_w, .AppendedData, {{"encoding", "raw"}})
 	xml_writer_write_string(&xml_w, "_")
-	xml_writer_write_bytes(&xml_w, appended[:])
+	for b in blocks {
+		n := transmute([8]u8)u64(len(b))
+		xml_writer_write_bytes(&xml_w, n[:])
+		xml_writer_write_bytes(&xml_w, b)
+	}
 	xml_close_tag(&xml_w)
 
 	if xml_w.err != nil {
@@ -271,59 +249,32 @@ vtu_write :: proc(w: ^VTU_Writer, req: Write_Request) -> bool {
 		return false
 	}
 
-	if _, has := w.cfg.pvd_path.?; has {
+	if pvd_path, has := w.cfg.pvd_path.?; has {
 		b: [32]u8
 		time_val := req.time.? or_else cast(f64)(req.step.? or_else 0)
 		time_str := strconv.write_float(b[:], time_val, 'f', 8, 64)
 
+		// readers resolve the file against the pvd's directory, not the working directory
+		file, rel_err := filepath.rel(filepath.dir(pvd_path), path)
+		if rel_err != nil { file = path }
+
 		xml_open_tag(
 			&w.pvd_writer,
 			.DataSet,
-			{{"timestep", time_str[1:]}, {"group", ""}, {"part", "0"}, {"file", path}}, // [:1] slices off the leading '+'
+			{{"timestep", time_str[1:]}, {"group", ""}, {"part", "0"}, {"file", file}}, // [1:] slices off the leading '+'
 		)
 		xml_close_tag(&w.pvd_writer)
 	}
 
 	return true
-
-	appended_write :: proc(appended: ^[dynamic]u8, data: []u8) -> (offset: string) {
-		@(static) b: [32]u8
-		offset = strconv.write_int(b[:], cast(i64)len(appended), 10)
-		len_bytes := transmute([8]u8)uint(len(data))
-		append(appended, ..(len_bytes[:]))
-		append(appended, ..data)
-		return offset
-	}
-
-	appended_write_chunks :: proc(appended: ^[dynamic]u8, chunks: [][]f64) -> (offset: string) {
-		@(static) b: [32]u8
-		offset = strconv.write_int(b[:], cast(i64)len(appended), 10)
-
-		header_pos := len(appended)
-		resize(appended, header_pos + 8) // placeholder length, patched below
-
-		data_start := len(appended)
-		for chunk in chunks {
-			append(appended, ..mem.slice_to_bytes(chunk))
-		}
-		data_len := len(appended) - data_start
-
-		len_bytes := transmute([8]u8)uint(data_len)
-		copy(appended[header_pos:header_pos + 8], len_bytes[:])
-
-		return offset
-	}
 }
 
-vtu_takedown :: proc(w: ^VTU_Writer) {
+vtu_destroy :: proc(w: ^VTU_Writer) {
 	if _, has := w.cfg.pvd_path.?; has {
 		xml_close_tag(&w.pvd_writer) // closes Collection
 		xml_close_tag(&w.pvd_writer) // closes VTKFile
 		os.close(w.pvd_fd)
 	}
-
-	arena := w.arena //stops arena from freeing itself
-	virtual.arena_destroy(&arena)
 }
 
 

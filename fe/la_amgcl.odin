@@ -8,6 +8,9 @@ import "core:c"
 
 BUILD_DIR :: #config(BUILD_DIR, "../build")
 
+// Set when the wrapper was built with ./build_amgcl.sh --openmp, links the OpenMP runtime.
+AMGCL_OPENMP :: #config(AMGCL_OPENMP, false)
+
 when ODIN_OS == .Windows {
 	LIB_PATH :: BUILD_DIR + "/amgcl.lib"
 } else {
@@ -20,6 +23,7 @@ foreign import amgcl_lib {LIB_PATH}
 when ODIN_OS == .Linux {
 	@(require) foreign import libm "system:m"
 	@(require) foreign import libstdcpp "system:stdc++"
+	when AMGCL_OPENMP { @(require) foreign import libgomp "system:gomp" }
 }
 
 Amgcl_Status :: enum c.int {

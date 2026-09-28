@@ -92,11 +92,6 @@ small_mat_view_from_slice :: proc(data: []$T, $R, $C: int) -> ^Small_Mat(R, C, T
 	return cast(^Small_Mat(R, C, T))raw_data(data)
 }
 
-// Odin matrix representation of the small matrix, only usable if T is supported by Odins matrix.
-small_mat_view_as_matrix :: proc(m: ^Small_Mat($R, $C, $T)) -> ^matrix[R, C]T {
-	return cast(^matrix[R, C]T)m.data
-}
-
 // Generally prefer to handle transpose inline an operation, but here if needed.
 small_mat_transpose :: proc(m: Small_Mat($R, $C, $T)) -> (r: Small_Mat(C, R, T)) {
 	#unroll for col in 0 ..< C {
@@ -313,7 +308,7 @@ small_mat_inv_t :: proc {
 	small_mat3x3_inv_t,
 }
 
-// Inverse (or pesudo-inverse)
+// Inverse (or pseudo-inverse)
 small_mat_inv :: proc(m: Small_Mat($R, $C, $T)) -> Small_Mat(C, R, T) {
 	return small_mat_transpose(small_mat_inv_t(m))
 }

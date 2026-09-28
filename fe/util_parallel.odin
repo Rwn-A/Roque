@@ -82,24 +82,6 @@ narrow_end :: proc(was_narrowed: bool) {
 	rank_sync()
 }
 
-//== solo (all ranks think they are single-threaded)
-
-
-// Each rank believes its the only rank in a group, unlike narrow, where only one rank continues.
-// usage: `solo() ... solo_end()`.
-solo :: proc() -> Rank_Ctx {
-	saved := rank_ctx
-	rank_ctx = Rank_Ctx {
-		idx   = 0,
-		count = 1,
-	}
-	return saved
-}
-
-solo_end :: proc(saved: Rank_Ctx) {
-	rank_ctx = saved
-}
-
 //== synchronization
 
 // Block until all ranks have arrived
@@ -108,7 +90,7 @@ rank_sync :: proc() {
 }
 
 // Copy `value` from `source_idx` into every other rank's `value`.
-// Warning: by default writes the value from rank 0, the default narrowing rank.
+// Warning: by default writes the value from rank 0, the default narrowing rank. Collective.
 rank_sync_value :: proc(value: ^$T, source_idx: int = 0) {
 	if rank_count() <= 1 { return }
 
@@ -128,7 +110,7 @@ rank_sync_value :: proc(value: ^$T, source_idx: int = 0) {
 }
 
 // Combine all ranks' `local` with the given procedure. Every rank returns the same result.
-// For simple numerical types see `rank_sum`.
+// For simple numerical types see `rank_sum`. Collective.
 rank_reduce :: proc(local: $T, $combine: proc(a, b: T) -> T) -> T {
 	if rank_count() <= 1 { return local }
 
@@ -146,7 +128,7 @@ rank_reduce :: proc(local: $T, $combine: proc(a, b: T) -> T) -> T {
 	return result
 }
 
-// Sum each rank's `local`. Given local must support `+` operator.
+// Sum each rank's `local`. Given local must support `+` operator. Collective.
 rank_sum :: proc(local: $T) -> T where intrinsics.type_is_numeric(T) {
 	return rank_reduce(local, proc(a, b: T) -> T { return a + b })
 }
@@ -184,7 +166,7 @@ Task_Pool :: struct {
 	count:   int,
 }
 
-// create a task pool, all ranks must be supplying the same pool pointer.
+// Create a task pool, all ranks must be supplying the same pool pointer. Collective.
 rank_task_pool_init :: proc(pool: ^Task_Pool, count: int) {
 	rank_sync()
 	if narrow() { pool.counter = 0; pool.count = count }

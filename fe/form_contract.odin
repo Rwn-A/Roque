@@ -23,8 +23,8 @@ Bvec_Point :: struct(T: typeid) {
 	data:         []T,
 }
 
-bvec_create :: proc($T: typeid, points, dofs, cmpnts: int, alloc := context.allocator) -> Bvec(T) {
-	return {points = points, dofs = dofs, cmpnts = cmpnts, data = make([]T, points * dofs * cmpnts, alloc)}
+bvec_create :: proc($T: typeid, n_points, dofs, cmpnts: int, alloc := context.allocator) -> Bvec(T) {
+	return {points = n_points, dofs = dofs, cmpnts = cmpnts, data = make([]T, n_points * dofs * cmpnts, alloc)}
 }
 
 bvec_at_point :: proc(bvec: Bvec($T), point: int) -> Bvec_Point(T) {
@@ -54,8 +54,8 @@ Pvec_Point :: struct(T: typeid) {
 	data:           []T,
 }
 
-pvec_create :: proc($T: typeid, np, cmpnts, fields: int, alloc := context.allocator) -> Pvec(T) {
-	return {np, cmpnts, fields, make([]T, np * fields * cmpnts, alloc)}
+pvec_create :: proc($T: typeid, n_points, cmpnts, fields: int, alloc := context.allocator) -> Pvec(T) {
+	return {n_points, cmpnts, fields, make([]T, n_points * fields * cmpnts, alloc)}
 }
 
 pvec_at_point :: proc(pvec: Pvec($T), point: int) -> Pvec_Point(T) {
@@ -105,7 +105,7 @@ cvec_push_inplace :: proc(c: Cvec($T), frames: []Small_Mat($F, F, T)) {
 }
 
 // c_dof = frames[dof]^T * c_dof. Scatter for a dual (residual, load) that was gathered with `frames`.
-cvec_push_inplace_t :: proc($F: int, c: Cvec($T), frames: []Small_Mat(F, F, T)) {
+cvec_push_inplace_t :: proc(c: Cvec($T), frames: []Small_Mat($F, F, T)) {
 	assert(c.fields == F && (len(frames) == 1 || len(frames) == c.dofs))
 	for dof in 0 ..< c.dofs {
 		v := cvec_dof_vec(c, dof, F)
@@ -120,13 +120,13 @@ Cmat :: struct(T: typeid) {
 	data:                   []T,
 }
 
-cmat_create :: proc($T: typeid, r_dofs, c_dofs: int, r_fields, c_fields: int, alloc := context.allocator) -> Cmat(T) {
+cmat_create :: proc($T: typeid, row_dofs, row_fields, col_dofs, col_fields: int, alloc := context.allocator) -> Cmat(T) {
 	return {
-		row_dofs = r_dofs,
-		col_dofs = c_dofs,
-		row_fields = r_fields,
-		col_fields = c_fields,
-		data = make([]T, r_dofs * c_dofs * r_fields * c_fields, alloc),
+		row_dofs = row_dofs,
+		col_dofs = col_dofs,
+		row_fields = row_fields,
+		col_fields = col_fields,
+		data = make([]T, row_dofs * col_dofs * row_fields * col_fields, alloc),
 	}
 }
 
@@ -135,16 +135,15 @@ cmat_create :: proc($T: typeid, r_dofs, c_dofs: int, r_fields, c_fields: int, al
 cmat_create_for :: proc(rb: Bvec($BT), p: Pmat($T), cb: Bvec(BT), alloc := context.allocator) -> Cmat(T) {
 	assert(rb.cmpnts == p.layout.row_cmpnts && cb.cmpnts == p.layout.col_cmpnts)
 	assert(rb.points == p.points && cb.points == p.points)
-	return cmat_create(T, rb.dofs, cb.dofs, p.layout.row_fields, p.layout.col_fields, alloc)
+	return cmat_create(T, rb.dofs, p.layout.row_fields, cb.dofs, p.layout.col_fields, alloc)
 }
 
 // Returns the field block (column-field major) at the dof pair
 cmat_dof_block :: proc(cmat: Cmat($T), rdof, cdof: int) -> []T {
 	block_size := cmat.col_fields * cmat.row_fields
 	offset := (rdof * cmat.col_dofs + cdof) * block_size
-	return cmat.data[offset:]
+	return cmat.data[offset:][:block_size]
 }
-
 
 // Returns a view of the (row_fields x col_fields) block coupling `rdof` and `cdof`.
 cmat_dof_matrix :: proc(cmat: Cmat($T), rdof, cdof: int, $RF, $CF: int) -> ^Small_Mat(RF, CF, T) {
@@ -182,12 +181,12 @@ cmat_push_inplace_t :: proc(c: Cmat($T), rframes: []Small_Mat($RF, RF, T), cfram
 	}
 }
 
-// Matrix of point space data, commonly a 4th order tensor such as the constitutive tensor in elasticty.
+// Matrix of point space data, commonly a 4th order tensor such as the constitutive tensor in elasticity.
 Pmat :: struct(T: typeid) {
-	points:                 int,
-	layout:                 Pmat_Layout,
-	field_blocks_per_point: int,
-	data:                   []T,
+	points:         int,
+	layout:         Pmat_Layout,
+	n_cmpnt_blocks: int, // component blocks per point, each row_fields x col_fields
+	data:           []T,
 }
 
 Pmat_Layout :: struct {
@@ -196,12 +195,12 @@ Pmat_Layout :: struct {
 	shape:                  Pmat_Shape,
 }
 
-// Shape describes the block-shape of the pmat (componext-aixs), each field block is dense.
-// DENSE and DIAGONAL field blocks may be rectangular. SYMMETRIC requires equal field counts.
+// Block shape of the pmat over the component axes, each field block is dense.
+// Dense and Diagonal field blocks may be rectangular, Symmetric requires equal field counts.
 Pmat_Shape :: enum {
-	DENSE,
-	SYMMETRIC,
-	DIAGONAL,
+	Dense,
+	Symmetric,
+	Diagonal,
 }
 
 Pmat_Point :: struct($T: typeid) {
@@ -210,41 +209,54 @@ Pmat_Point :: struct($T: typeid) {
 }
 
 Pmat_Block_Status :: enum {
-	MISSING,
-	FOUND,
-	TRANSPOSED,
+	Missing,
+	Found,
+	Transposed,
 }
 
 pmat_create :: proc(
 	$T: typeid,
-	np: int,
+	n_points: int,
 	s: Pmat_Shape,
 	row_cmpnts, row_fields, col_cmpnts, col_fields: int,
 	alloc := context.allocator,
 ) -> Pmat(T) {
 	layout := Pmat_Layout{row_cmpnts, row_fields, col_cmpnts, col_fields, s}
 
-	assert(s == .DENSE || row_cmpnts == col_cmpnts, "Non-dense shape requires equal component counts.")
+	assert(s == .Dense || row_cmpnts == col_cmpnts, "Non-dense shape requires equal component counts.")
 
-	num_blocks: int
+	n_blocks: int
 	switch s {
-	case .DENSE: num_blocks = row_cmpnts * col_cmpnts
-	case .DIAGONAL: num_blocks = row_cmpnts
-	case .SYMMETRIC:
+	case .Dense: n_blocks = row_cmpnts * col_cmpnts
+	case .Diagonal: n_blocks = row_cmpnts
+	case .Symmetric:
 		assert(row_fields == col_fields, "Symmetry requires equal field counts.")
-		num_blocks = row_cmpnts * (row_cmpnts + 1) / 2
+		n_blocks = row_cmpnts * (row_cmpnts + 1) / 2
 	}
-	data := make([]T, np * num_blocks * row_fields * col_fields, alloc)
-	return {points = np, layout = layout, field_blocks_per_point = num_blocks, data = data}
+	data := make([]T, n_points * n_blocks * row_fields * col_fields, alloc)
+	return {points = n_points, layout = layout, n_cmpnt_blocks = n_blocks, data = data}
 }
 
 // Create a symmetric point matrix
-pmat_create_symmetric :: proc($T: typeid, np, cmpnts, fields: int, alloc := context.allocator) -> Pmat(T) {
-	return pmat_create(T, np, .SYMMETRIC, cmpnts, fields, cmpnts, fields, alloc)
+pmat_create_symmetric :: proc($T: typeid, n_points, cmpnts, fields: int, alloc := context.allocator) -> Pmat(T) {
+	return pmat_create(T, n_points, .Symmetric, cmpnts, fields, cmpnts, fields, alloc)
+}
+
+// Identity over components and fields at every point, scaled by scale * weights[p]. Mass terms, u . v dx.
+pmat_create_identity :: proc(weights: []f64, cmpnts, fields: int, scale := 1.0, alloc := context.allocator) -> Pmat(f64) {
+	pm := pmat_create(f64, len(weights), .Diagonal, cmpnts, fields, cmpnts, fields, alloc)
+	for w, p in weights {
+		pp := pmat_at_point(pm, p)
+		for c in 0 ..< cmpnts {
+			blk := pp.data[c * fields * fields:][:fields * fields]
+			for f in 0 ..< fields { blk[f * fields + f] = scale * w }
+		}
+	}
+	return pm
 }
 
 pmat_at_point :: proc(pmat: Pmat($T), point: int) -> Pmat_Point(T) {
-	point_size := pmat.field_blocks_per_point * pmat.layout.row_fields * pmat.layout.col_fields
+	point_size := pmat.n_cmpnt_blocks * pmat.layout.row_fields * pmat.layout.col_fields
 	return {pmat.layout, pmat.data[point * point_size:][:point_size]}
 }
 
@@ -259,18 +271,18 @@ pmat_cmpnt_matrix :: proc(
 ) {
 	block: int
 	switch pp.shape {
-	case .DENSE: block = rc * pp.col_cmpnts + cc
-	case .DIAGONAL:
-		if rc != cc { return {}, .MISSING }
+	case .Dense: block = rc * pp.col_cmpnts + cc
+	case .Diagonal:
+		if rc != cc { return {}, .Missing }
 		block = rc
-	case .SYMMETRIC:
+	case .Symmetric:
 		if cc > rc {
 			block = cc * (cc + 1) / 2 + rc
-			return small_mat_view_from_slice(pp.data[block * RF * CF:], RF, CF), .TRANSPOSED
+			return small_mat_view_from_slice(pp.data[block * RF * CF:], RF, CF), .Transposed
 		}
 		block = rc * (rc + 1) / 2 + cc
 	}
-	return small_mat_view_from_slice(pp.data[block * RF * CF:], RF, CF), .FOUND
+	return small_mat_view_from_slice(pp.data[block * RF * CF:], RF, CF), .Found
 }
 
 //== contractions
@@ -311,7 +323,7 @@ contract_bilinear :: proc($RC, $RF, $CC, $CF: int, c: Cmat($T), rb: Bvec(T), p: 
 	assert(p.layout.col_cmpnts == CC && p.layout.col_fields == CF)
 	assert(c.row_dofs == rb.dofs && c.col_dofs == cb.dofs)
 	assert(p.points == rb.points && p.points == cb.points)
-	when RF != CF { assert(p.layout.shape != .SYMMETRIC, "Symmetric pmat requires equal field counts.") }
+	when RF != CF { assert(p.layout.shape != .Symmetric, "Symmetric pmat requires equal field counts.") }
 
 	for point in 0 ..< p.points {
 		rbp, cbp, pp := bvec_at_point(rb, point), bvec_at_point(cb, point), pmat_at_point(p, point)
@@ -325,11 +337,10 @@ contract_bilinear :: proc($RC, $RF, $CC, $CF: int, c: Cmat($T), rb: Bvec(T), p: 
 				for cc in 0 ..< CC {
 					block, status := pmat_cmpnt_matrix(pp, rc, cc, RF, CF)
 					switch status {
-					case .MISSING: continue
-					case .FOUND: small_mat_add_inplace(&pc[rc], block^, cv.data[cc])
-					case .TRANSPOSED: when RF == CF {
-								small_mat_add_inplace_t(&pc[rc], block^, cv.data[cc])} else {unreachable()
-							}
+					case .Missing: continue
+					case .Found: small_mat_add_inplace(&pc[rc], block^, cv.data[cc])
+					case .Transposed:
+						when RF == CF { small_mat_add_inplace_t(&pc[rc], block^, cv.data[cc]) } else { unreachable() }
 					}
 				}
 			}
@@ -363,9 +374,9 @@ contract_bilinear_same :: proc($CM, $FD: int, c: Cmat($T), b: Bvec(T), p: Pmat(T
 				for cc in 0 ..< CM {
 					block, status := pmat_cmpnt_matrix(pp, rc, cc, FD, FD)
 					switch status {
-					case .MISSING: continue
-					case .FOUND: small_mat_add_inplace(&pc[rc], block^, cv.data[cc])
-					case .TRANSPOSED: small_mat_add_inplace_t(&pc[rc], block^, cv.data[cc])
+					case .Missing: continue
+					case .Found: small_mat_add_inplace(&pc[rc], block^, cv.data[cc])
+					case .Transposed: small_mat_add_inplace_t(&pc[rc], block^, cv.data[cc])
 					}
 				}
 			}

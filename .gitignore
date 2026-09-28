@@ -3,4 +3,7 @@ build/*
 !build/.gitkeep
 validation/output/*
 !validation/output/.gitkeep
+demos/output/*
+!demos/output/.gitkeep
 todo.md
+research

@@ -3,7 +3,7 @@ package fe
 /*
  Basic thread-local scratch allocator.
 
- Lazily initialized for convienence when starting up new threads.
+ Lazily initialized for convenience when starting up new threads.
  Backed by an arena for quick allocations.
  Arena is automatically destroyed when thread is released.
 */
@@ -50,10 +50,15 @@ scratch_guard :: proc() -> Scratch_Temp {
 scratch_arena :: proc() -> ^Scratch_Arena {
 	if _scratch_arena == {} { 	// lazy setup
 		if err := virtual.arena_init_growing(&_scratch_arena); err != nil { panic("failed to init scratch arena") }
-		runtime.add_thread_local_cleaner(proc "contextless" () {
-			context = runtime.default_context()
-			virtual.arena_destroy(&_scratch_arena)
-		})
 	}
 	return &_scratch_arena
+}
+
+@(init, private = "file")
+scratch_register_cleaner :: proc "contextless" () {
+	runtime.add_thread_local_cleaner(proc "contextless" () {
+		if _scratch_arena == {} { return }
+		context = runtime.default_context()
+		virtual.arena_destroy(&_scratch_arena)
+	})
 }
