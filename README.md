@@ -2,9 +2,14 @@
 
 A small finite element library for solving partial differential equations, written in Odin.
 
-![A heated beam bending and unbending](demo.gif)
+<p align="center">
+  <img src="demo.gif" width="49%" alt="A heated beam bending and unbending">
+  <img src="demo_shedding.gif" width="49%" alt="A von Karman vortex street behind a square cylinder">
+</p>
 
-_A cantilever beam gets its top face heated and cooled on repeat, and bends accordingly (`demos/thermo_elastic`)._
+_Left: a cantilever beam gets its top face heated and cooled on repeat, and bends accordingly (`demos/thermo_elastic`).
+Right: a von Kármán vortex street shed from a square cylinder at Re = 100, coloured by vorticity
+(`demos/vortex_street`)._
 
 > [!NOTE]
 > Roque is still in development. 
